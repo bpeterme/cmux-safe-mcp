@@ -54,9 +54,17 @@ without cbox, and nothing in it may depend on cbox.
   push, check CI and fix failures before calling the task done.
 - **Commit messages:** a type prefix (`feat:`, `fix:`, `test:`, `ci:`, `docs:`),
   one topic per commit.
-- **Identity:** GitHub refuses pushes that expose the user's real email. Commit
-  with `git -c user.email="48397193+bpeterme@users.noreply.github.com"
-  -c user.name="bpeterme" commit ...`. Never edit the git config.
+- **Identity:** every commit is by `bpeterme` with the noreply email (GitHub
+  refuses pushes that expose the user's real email). Set it through the
+  environment for each git command that creates commits (commit, merge, rebase):
+  ```sh
+  export GIT_AUTHOR_NAME=bpeterme GIT_COMMITTER_NAME=bpeterme \
+    GIT_AUTHOR_EMAIL=48397193+bpeterme@users.noreply.github.com \
+    GIT_COMMITTER_EMAIL=48397193+bpeterme@users.noreply.github.com
+  ```
+  Not `git -c user.name=...`: the container sets `GIT_AUTHOR_NAME` and friends,
+  and they override `-c`. Check with `git --no-pager log --format='%an <%ae>' -1`
+  before pushing. Never edit the git config.
 - **Merging into `main` only when the user asks:**
   `git merge --no-ff dev -m "Merge dev: <summary>"`, push `main`, switch back to
   `dev`. Never fast-forward. Never merge `main` back into `dev`; `main` having
@@ -67,7 +75,7 @@ without cbox, and nothing in it may depend on cbox.
 
 - The user runs them in their own terminal: no `!` prefix.
 - Use `git --no-pager` for `log`, `diff` and `show`: no pager to quit.
-- Commits made on the Mac also need the noreply `-c` override above.
+- Commits made on the Mac need the same identity `export` as above.
 
 ## Releases
 
