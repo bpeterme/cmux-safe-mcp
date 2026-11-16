@@ -71,7 +71,14 @@ without cbox, and nothing in it may depend on cbox.
 
 ## Releases
 
-There is no release pipeline yet: pushing `main` does not tag or publish
-anything. Planned: a Homebrew formula in the user's tap, using the same
-automatic release on `main` as claudebox and flux. PyPI (`uvx`) only if other
-users show up.
+Every push to `main` releases automatically (`.github/workflows/release.yml`,
+same as claudebox): once the Test workflow passes, it tags `YYYY.MM.DD.N`,
+creates the GitHub release and updates the formula in the tap
+`bpeterme/homebrew-cmux-safe-mcp`. Never ask the user to tag by hand.
+
+- The version lives only in the tag: the source keeps `VERSION = "dev"`, and
+  the formula replaces it (`HEAD-<sha>` for `brew install --HEAD`).
+- `Formula/cmux-safe-mcp.rb` here is head-only; the release adds `url` and
+  `sha256` before `license "MIT"` and rewrites the test. Keep those lines as
+  they are (a test checks them).
+- PyPI (`uvx`) only if other users show up.
