@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  # Only after the Test workflow passed on a push to main — a failing
+  # main never reaches a tag or the Homebrew tap. (workflow_run always uses
+  # this file as it is on main.)
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+    branches: [main]
+
+# GitHub occasionally delivers an event twice, and a test run can be re-run. Runs queue up instead of
+# racing, and a run whose commit already has a release tag stops early.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Tag, create GitHub release, and update Homebrew tap
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.actor.login != 'github-actions[bot]'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}  # the commit that was tested
+          fetch-depth: 0
+
+      - name: Skip when this commit is already released
+        id: guard
+        run: |
+          git fetch --tags --force --quiet
+          tag=$(git tag --points-at HEAD | grep -E '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$' | head -1 || true)
+          if [[ -n "$tag" ]]; then
+            echo "Already released as ${tag} — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute CalVer version
+        if: steps.guard.outputs.skip != 'true'
+        id: version
+        run: |
+          today=$(date -u +%Y.%m.%d)
+          highest=$(git tag -l "${today}.*" | sed "s/^${today}\.//" | sort -n | tail -1)
+          if [[ -z "$highest" ]]; then
+            n=0
+          else
+            n=$((highest + 1))
+          fi
+          echo "value=${today}.${n}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          git tag "${{ steps.version.outputs.value }}"
+          git push origin "${{ steps.version.outputs.value }}"
+
+      - name: Create GitHub release
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.value }}" \
+            --title "${{ steps.version.outputs.value }}" \
+            --generate-notes \
+            --latest
+
+      - name: Compute release tarball SHA256
+        if: steps.guard.outputs.skip != 'true'
+        id: sha256
+        run: |
+          version="${{ steps.version.outputs.value }}"
+          url="https://github.com/bpeterme/cmux-safe-mcp/archive/refs/tags/${version}.tar.gz"
+          sha=""
+          for i in $(seq 1 12); do
+            if curl -fsSL -o /tmp/release.tar.gz "$url" 2>/dev/null; then
+              sha=$(sha256sum /tmp/release.tar.gz | awk '{print $1}')
+              break
+            fi
+            echo "Tarball not ready yet, retrying (${i}/12)..."
+            sleep 5
+          done
+          [[ -n "$sha" ]] || { echo "Error: tarball not available after 60s"; exit 1; }
+          echo "value=${sha}" >> "$GITHUB_OUTPUT"
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew tap formula
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          URL: ${{ steps.sha256.outputs.url }}
+          SHA256: ${{ steps.sha256.outputs.value }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/bpeterme/homebrew-cmux-safe-mcp.git" tap
+          # Always base the tap formula on the current main repo formula so
+          # structural changes (new deps, updated description, etc.) are picked up.
+          mkdir -p tap/Formula
+          cp Formula/cmux-safe-mcp.rb tap/Formula/cmux-safe-mcp.rb
+          python3 << 'EOF'
+          import os, re
+          path = "tap/Formula/cmux-safe-mcp.rb"
+          url  = os.environ["URL"]
+          sha  = os.environ["SHA256"]
+          with open(path) as f:
+              content = f.read()
+          # Insert url + sha256 before license
+          # (main repo formula is always head-only, so we always insert)
+          content = content.replace(
+              '  license "MIT"',
+              f'  url "{url}"\n  sha256 "{sha}"\n  license "MIT"'
+          )
+          # Restore stable test (head-only formula uses a different assertion)
+          content = content.replace(
+              'assert_match "cmux-safe-mcp HEAD-", shell_output("#{bin}/cmux-safe-mcp version")',
+              'assert_match version.to_s, shell_output("#{bin}/cmux-safe-mcp version")'
+          )
+          with open(path, "w") as f:
+              f.write(content)
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cmux-safe-mcp.rb
+          git commit -m "cmux-safe-mcp ${VERSION}"
+          git push

@@ -41,14 +41,31 @@ agents in each workspace. `cmux_list` leaves them out.
 
 ## Install
 
-Needs macOS with cmux, `python3` and `git`. There are no other dependencies;
-the server is one file.
+Needs macOS with cmux, `python3` and `git` (both come with the Command Line
+Tools). There are no other dependencies; the server is one file.
+
+### Homebrew (recommended)
+
+```sh
+brew tap bpeterme/cmux-safe-mcp
+brew install bpeterme/cmux-safe-mcp/cmux-safe-mcp
+cmux-safe-mcp version
+```
+
+### Manual
 
 ```sh
 curl -fsSL -o ~/.local/bin/cmux-safe-mcp \
   https://raw.githubusercontent.com/bpeterme/cmux-safe-mcp/main/cmux-safe-mcp
 chmod +x ~/.local/bin/cmux-safe-mcp
 ```
+
+With a manual install, use the full path (`/Users/<you>/.local/bin/cmux-safe-mcp`)
+as the command in the MCP entries below.
+
+**Switching to Homebrew?** Remove the old file or symlink first, so it doesn't
+shadow the Homebrew one: `rm ~/.local/bin/cmux-safe-mcp`. Then set the command
+in your MCP entries to plain `cmux-safe-mcp`.
 
 ### 1. Settings
 
@@ -90,10 +107,10 @@ cmux-safe-mcp check
 
 ### 3. Add it to your MCP client
 
-- **Claude Code:** `claude mcp add cmux -- ~/.local/bin/cmux-safe-mcp`
+- **Claude Code:** `claude mcp add cmux -- cmux-safe-mcp`
 - **cbox:** in `~/.config/claudebox/mcp.json`:
   ```json
-  { "mcpServers": { "cmux": { "command": "/Users/<you>/.local/bin/cmux-safe-mcp" } } }
+  { "mcpServers": { "cmux": { "command": "cmux-safe-mcp" } } }
   ```
   cbox starts it on the Mac when the agent connects; the container only gets
   the tools.

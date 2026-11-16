@@ -366,5 +366,57 @@ class ProtocolTests(Base):
         self.assertIn("cmux answers: 2 workspaces", p.stdout)
 
 
+class VersionTests(Base):
+    # The Homebrew formula replaces this exact text; a source without it fails `brew install`.
+    PLACEHOLDER = 'VERSION = "dev"'
+
+    def released(self, version):
+        """A copy of the script with the placeholder replaced, as the formula does."""
+        with open(SCRIPT) as f:
+            source = f.read()
+        path = os.path.join(self.t, "cmux-safe-mcp")
+        with open(path, "w") as f:
+            f.write(source.replace(self.PLACEHOLDER, f'VERSION = "{version}"'))
+        return path
+
+    def version_of(self, script):
+        return subprocess.run([sys.executable, script, "version"], capture_output=True, text=True,
+                              timeout=30).stdout.strip()
+
+    def server_version_of(self, script):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+        p = subprocess.run([sys.executable, script], input=json.dumps(msg) + "\n", capture_output=True,
+                           text=True, timeout=30, env=os.environ)
+        return json.loads(p.stdout)["result"]["serverInfo"]["version"]
+
+    def test_source_has_the_placeholder_once(self):
+        with open(SCRIPT) as f:
+            self.assertEqual(f.read().count(self.PLACEHOLDER), 1)
+        self.assertEqual(m.VERSION, "dev")
+
+    def test_formula_and_release_workflow_match(self):
+        # release.yml rewrites exact lines of the formula; if one drifts, the tap gets a broken formula.
+        def read(*parts):
+            with open(os.path.join(ROOT, *parts)) as f:
+                return f.read()
+        formula = read("Formula", "cmux-safe-mcp.rb")
+        release = read(".github", "workflows", "release.yml")
+        self.assertIn(f"inreplace \"cmux-safe-mcp\", '{self.PLACEHOLDER}',", formula)
+        head_test = 'assert_match "cmux-safe-mcp HEAD-", shell_output("#{bin}/cmux-safe-mcp version")'
+        for line in ('  license "MIT"', head_test):
+            self.assertEqual(formula.count(line), 1, line)
+            self.assertIn(line, release)
+
+    def test_unreleased_source_says_dev(self):
+        self.assertEqual(self.version_of(SCRIPT), "cmux-safe-mcp dev")
+        self.assertEqual(self.server_version_of(SCRIPT), "dev")
+
+    def test_release_version_is_used_everywhere(self):
+        for version in ("2026.01.02.3", "HEAD-abc1234"):
+            script = self.released(version)
+            self.assertEqual(self.version_of(script), f"cmux-safe-mcp {version}")
+            self.assertEqual(self.server_version_of(script), version)
+
+
 if __name__ == "__main__":
     unittest.main()
