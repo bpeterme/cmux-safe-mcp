@@ -38,7 +38,7 @@ FAKE_CMUX = textwrap.dedent("""\
         print("OK")
     """)
 
-OWN_ID = "6B5B72BF-9DFC-4933-8885-E311B461ABD8"
+OWN_ID = "11111111-2222-4333-8444-555555555555"
 
 
 def workspace(ref, title, folder, wid="00000000-0000-0000-0000-000000000000", **kw):
