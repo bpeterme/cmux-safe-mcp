@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""cmux-safe-mcp — an MCP server with only the safe parts of cmux.
+
+Lets an agent you don't want at your keyboard work with cmux: list workspaces,
+open a repo in a new workspace (cloned when missing), switch to, rename, color,
+describe, pin and (opt-in) close workspaces, and notify you or show status in
+its own sidebar entry. Never: typing into terminals, running commands, reading
+screens, the browser, or any other cmux command. The only command a new
+workspace starts is the one in your settings (command =), never the agent's.
+
+Made for agents in containers (e.g. cbox, whose host MCP relay runs it on the
+Mac), and useful for any MCP client. Settings: ~/.config/cmux-safe-mcp/config.
+
+  cmux-safe-mcp          MCP server on stdin/stdout
+  cmux-safe-mcp check    tests the settings and the connection to cmux
+"""
+import configparser, fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile
+from fnmatch import fnmatchcase
+
+VERSION = "0.1.0"
+DEFAULT_FOLDER = "~/Workspace"
+DEFAULT_CLONE = "git@github.com:{repo}.git"
+COLORS = ("Red", "Crimson", "Orange", "Amber", "Olive", "Green", "Teal", "Aqua",
+          "Blue", "Navy", "Indigo", "Purple", "Magenta", "Rose", "Brown", "Charcoal")
+HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
+# A repo: owner/name (GitHub) or group/subgroup/.../name (GitLab, up to 20
+# groups deep). Each part: letters, digits, '_', '-', '.', never starting with
+# '-' or '.' (so no option-like names and no "." or "..").
+REPO_PART = r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}"
+REPO_RE = re.compile(rf"^{REPO_PART}(?:/{REPO_PART}){{1,20}}$")
+PATTERN_PART = r"[A-Za-z0-9_*?][A-Za-z0-9_.*?-]{0,99}"
+PATTERN_RE = re.compile(rf"^{PATTERN_PART}(?:/{PATTERN_PART}){{1,20}}$")
+SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+WORKSPACE_RE = re.compile(r"^(workspace:\d{1,20}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                          r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$")
+STATUS_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
+EXTRAS = {"close"}  # actions that stay off unless listed in allow =
+SETTINGS_KEYS = {"folder", "allow", "cmux", "command"}
+SOURCE_KEYS = {"repos", "clone"}
+# Fields of cmux's workspace list passed on. Not the others: cmux also reports
+# the latest messages of agents running in each workspace.
+LIST_FIELDS = ("ref", "title", "custom_color", "description", "current_directory", "pinned", "selected")
+
+
+class Refused(Exception):
+    """A request the server turns down, with what to do instead."""
+
+
+# --- settings -------------------------------------------------------------------
+
+def config_path():
+    if os.environ.get("CMUX_SAFE_MCP_CONFIG"):
+        return os.path.expanduser(os.environ["CMUX_SAFE_MCP_CONFIG"])
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "cmux-safe-mcp", "config")
+
+
+def patterns(src):
+    return [p for p in src.get("repos", "").replace(",", " ").split() if p]
+
+
+def load_config(path=None):
+    """{"folder", "allow", "cmux", "sources": [(name, {"repos", "clone"}), ...]}.
+    Problems raise Refused with the line to fix."""
+    path = path or config_path()
+    cp = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",), delimiters=("=",))
+    try:
+        if not cp.read(path):
+            raise Refused(f"no settings file: create {tilde(path)} (see: cmux-safe-mcp --help)")
+    except configparser.Error as e:
+        raise Refused(f"{tilde(path)} is not valid: {e}")
+    s = dict(cp["settings"]) if cp.has_section("settings") else {}
+    extra = set(s) - SETTINGS_KEYS
+    if extra:
+        raise Refused(f"[settings] {', '.join(sorted(extra))} is unknown (known: {', '.join(sorted(SETTINGS_KEYS))})")
+    allow = {a for a in s.get("allow", "").replace(",", " ").split() if a}
+    if allow - EXTRAS:
+        raise Refused(f"[settings] allow = {', '.join(sorted(allow - EXTRAS))} is unknown (known: {', '.join(sorted(EXTRAS))})")
+    folder = os.path.expanduser(s.get("folder", DEFAULT_FOLDER))
+    if not os.path.isabs(folder):
+        raise Refused("[settings] folder must be an absolute path, e.g. folder = ~/Workspace")
+    sources = []
+    for name in cp.sections():
+        if name == "settings":
+            continue
+        src = dict(cp[name])
+        if not SOURCE_RE.match(name):
+            raise Refused(f"[{name}]: a name may only contain a-z, 0-9, '.', '_' and '-'")
+        if set(src) - SOURCE_KEYS:
+            raise Refused(f"[{name}] {', '.join(sorted(set(src) - SOURCE_KEYS))} is unknown (known: repos, clone)")
+        if not patterns(src):
+            raise Refused(f"[{name}] repos is missing: the owner/name patterns to open, e.g. repos = my-org/*")
+        for p in patterns(src):
+            if not PATTERN_RE.match(p):
+                raise Refused(f"[{name}] repos entry '{p}' is not an owner/name pattern "
+                              "(e.g. my-org/*, my-user/notes or my-group/sub/*)")
+        if "{repo}" not in src.get("clone", "{repo}"):
+            raise Refused(f"[{name}] clone must contain {{repo}}, e.g. clone = git@github.com:{{repo}}.git")
+        sources.append((name, {"repos": src["repos"], "clone": src.get("clone", DEFAULT_CLONE)}))
+    command = s.get("command", "").strip()
+    if any(ord(c) < 32 or ord(c) == 127 for c in command):
+        raise Refused("[settings] command must be one line")
+    return {"folder": os.path.realpath(folder), "allow": allow, "cmux": s.get("cmux", ""),
+            "command": command, "sources": sources}
+
+
+def tilde(path):
+    home = os.path.realpath(os.path.expanduser("~"))
+    path = os.path.realpath(path)
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
+
+
+# --- cmux -----------------------------------------------------------------------
+
+def cmux(cfg, args):
+    """Output of the cmux CLI with args, as a list (never a shell). The caller's
+    workspace and surface are dropped from the environment, so nothing targets
+    a workspace by default: every command names its workspace."""
+    exe = os.path.expanduser(cfg["cmux"]) if cfg.get("cmux") else shutil.which("cmux")
+    if not exe:
+        raise Refused("cmux command not found — set its path in the settings: [settings] cmux = <path> "
+                      "(in a cmux terminal: command -v cmux)")
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("CMUX_") or k in ("CMUX_SOCKET_PATH", "CMUX_SOCKET_PASSWORD")}
+    env["CMUX_QUIET"] = "1"
+    try:
+        p = subprocess.run([exe] + args, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise Refused(f"cmux did not run: {e.__class__.__name__}")
+    out, errs = p.stdout.decode(errors="replace").strip(), p.stderr.decode(errors="replace").strip()
+    if p.returncode != 0:
+        msg = (errs or out)[-300:] or "no output"
+        hint = (" — cmux lets in only processes started in cmux terminals by default; in cmux's settings, "
+                "choose password mode (cmux then uses the password saved there)") if "denied" in msg.lower() else ""
+        raise Refused(f"cmux {args[0]} failed: {msg}{hint}")
+    return out
+
+
+def workspaces(cfg):
+    try:
+        data = json.loads(cmux(cfg, ["list-workspaces", "--json"]))
+    except ValueError:
+        raise Refused("cmux list-workspaces gave no JSON")
+    items = data.get("workspaces") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        raise Refused("cmux list-workspaces gave no workspace list")
+    return [w for w in items if isinstance(w, dict)]
+
+
+def own_workspace(items):
+    """The ref of the workspace this session runs in, or None: cmux sets
+    CMUX_WORKSPACE_ID in its terminals, and an MCP client started there (or
+    cbox's relay) passes it on. Without it, the one workspace whose folder is
+    the folder the client was started in (PWD)."""
+    wid = os.environ.get("CMUX_WORKSPACE_ID", "")
+    if wid:
+        for w in items:
+            if wid in (w.get("id"), w.get("ref")):
+                return w.get("ref")
+    pwd = os.environ.get("PWD", "")
+    if pwd:
+        here = [w for w in items if w.get("current_directory")
+                and os.path.realpath(w["current_directory"]) == os.path.realpath(pwd)]
+        if len(here) == 1:
+            return here[0].get("ref")
+    return None
+
+
+# --- argument checks -------------------------------------------------------------
+
+def text_arg(args, key, limit, required=True):
+    v = args.get(key)
+    if v is None or v == "":
+        if required:
+            raise Refused(f"{key} is missing")
+        return None
+    if not isinstance(v, str):
+        raise Refused(f"{key} must be a string")
+    if len(v) > limit:
+        raise Refused(f"{key} is longer than {limit} characters")
+    if any(ord(c) < 32 or ord(c) == 127 for c in v):
+        raise Refused(f"{key} must be one line, without control characters")
+    if v.startswith("-"):
+        raise Refused(f"{key} must not start with '-'")
+    return v
+
+
+def workspace_arg(cfg, args):
+    w = args.get("workspace")
+    if not isinstance(w, str) or not WORKSPACE_RE.match(w):
+        raise Refused("workspace must be a ref like workspace:12 or a workspace id (see cmux_list)")
+    return w
+
+
+def color_value(repo_or_none, asked):
+    """A cmux color name or #RRGGBB as cmux takes it; without asked, a named
+    color picked by the repo's name (the same repo always gets the same)."""
+    if asked:
+        named = {c.lower(): c for c in COLORS}
+        if not isinstance(asked, str):
+            raise Refused("color must be a string")
+        if asked.lower() in named:
+            return named[asked.lower()]
+        if HEX_COLOR_RE.match(asked):
+            return asked.upper()
+        raise Refused(f"color must be #RRGGBB or one of {', '.join(COLORS)}")
+    return COLORS[hashlib.sha256(repo_or_none.lower().encode()).digest()[0] % len(COLORS)]
+
+
+# --- opening a repo --------------------------------------------------------------
+
+def git_origin(path):
+    try:
+        p = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return p.stdout.decode(errors="replace").strip() if p.returncode == 0 else None
+
+
+def same_remote(a, b):
+    norm = lambda u: re.sub(r"(\.git)?/*$", "", (u or "").strip()).lower()
+    return bool(a) and norm(a) == norm(b)
+
+
+def clone_url(src, repo):
+    return src["clone"].replace("{repo}", repo)
+
+
+def candidates(cfg, repo, source=None):
+    """[(source name, source, owner/name)] that may be opened for repo, in the
+    settings' order. A bare name gets its owner from patterns with a fixed
+    owner (my-user/*, someone/notes): the agent cannot see the patterns."""
+    if not isinstance(repo, str) or not repo:
+        raise Refused("repo is missing")
+    sources = cfg["sources"]
+    if not sources:
+        raise Refused(f"no repos to open: add a section to {tilde(config_path())}, e.g. [github] repos = my-user/*")
+    if source is not None:
+        sources = [(n, s) for n, s in sources if n == source]
+        if not sources:
+            raise Refused(f"source must be one of: {', '.join(n for n, _ in cfg['sources'])}")
+    if repo.lower().endswith(".git"):
+        raise Refused("repo must be a name or owner/name, without .git")
+    if "/" in repo:
+        if not REPO_RE.match(repo):
+            raise Refused("repo must be a name or owner/name (GitLab: group/subgroup/name)")
+        found = [(n, s, repo) for n, s in sources if any(fnmatchcase(repo.lower(), p.lower()) for p in patterns(s))]
+        if not found:
+            raise Refused(f"{repo} is not among the repos you set up to open "
+                          f"({'; '.join(f'{n}: ' + ', '.join(patterns(s)) for n, s in sources)})")
+        return found
+    if not re.fullmatch(REPO_PART, repo):
+        raise Refused("repo must be a name or owner/name (GitLab: group/subgroup/name)")
+    found = []
+    for n, s in sources:
+        owners = {}
+        for p in patterns(s):
+            head, _, last = p.rpartition("/")
+            if not any(c in head for c in "*?") and fnmatchcase(repo.lower(), last.lower()):
+                owners.setdefault(f"{head}/{repo}".lower(), f"{head}/{repo}")
+        if len(owners) > 1:
+            # Two owners in one source are two different projects: never guess.
+            local = local_choice(cfg, repo, [(n, s, r) for r in owners.values()])
+            if not local:
+                raise Refused(f"{repo} could be {' or '.join(sorted(owners.values()))} — give owner/name")
+            found.append(local)
+        elif owners:
+            found.append((n, s, next(iter(owners.values()))))
+    if not found:
+        raise Refused(f"give owner/name: no repos setting fixes the owner of {repo}")
+    return found
+
+
+def local_choice(cfg, name, found):
+    """The candidate whose clone is already in the folder, if exactly one."""
+    path = os.path.join(cfg["folder"], name)
+    origin = git_origin(path) if os.path.isdir(path) else None
+    hits = [c for c in found if same_remote(origin, clone_url(c[1], c[2]))]
+    return hits[0] if len(hits) == 1 else None
+
+
+class Lock:
+    """One open at a time on this Mac: no two clones into one folder (each
+    agent connection is its own process)."""
+    def __enter__(self):
+        self.f = open(os.path.join(tempfile.gettempdir(), f"cmux-safe-mcp-{os.getuid()}.lock"), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def clone(url, path):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    try:
+        p = subprocess.run(["git", "clone", "--quiet", "--", url, path], env=env, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"did not finish ({e.__class__.__name__})"
+    if p.returncode != 0:
+        return (p.stdout.decode(errors="replace").strip().splitlines() or ["failed"])[-1][:300]
+    return None
+
+
+def tool_open(cfg, args):
+    found = candidates(cfg, args.get("repo"), args.get("source"))
+    name = found[0][2].rsplit("/", 1)[1]
+    path = os.path.join(cfg["folder"], name)
+    with Lock():
+        if os.path.lexists(path):
+            hit = local_choice(cfg, name, found) if os.path.isdir(path) else None
+            if not hit:
+                raise Refused(f"{tilde(path)} exists and is not a clone of "
+                              f"{' or '.join(clone_url(s, r) for _, s, r in found)} — move it away or open it by hand")
+            (source, _, repo), cloned = hit, False
+        else:
+            os.makedirs(cfg["folder"], exist_ok=True)
+            failures = []
+            for source, src, repo in found:  # the same repo on several hosts: the first that has it
+                problem = clone(clone_url(src, repo), path)
+                if not problem:
+                    break
+                failures.append(f"{source}: git clone {clone_url(src, repo)}: {problem}")
+            else:
+                raise Refused("could not clone — " + "; ".join(failures))
+            cloned = True
+        color = color_value(repo, args.get("color"))
+        # The first command comes from the user's settings only, never from the agent.
+        start = ["--command", cfg["command"]] if cfg["command"] else []
+        out = cmux(cfg, ["new-workspace", "--name", name, "--cwd", path, *start])
+        m = re.search(r"\bworkspace:\d+\b", out) or re.search(
+            r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b", out)
+        if not m:
+            raise Refused(f"cmux new-workspace gave no workspace: {out[-300:] or 'no output'}")
+        result = {"repo": repo, "source": source, "workspace": m.group(0), "folder": tilde(path),
+                  "cloned": cloned, "color": color}
+        try:
+            cmux(cfg, ["workspace-action", "--action", "set-color", "--color", color, "--workspace", m.group(0)])
+        except Refused as e:
+            result["warning"] = f"the workspace is open, but its color is not set: {e}"
+        return result
+
+
+# --- the other tools -------------------------------------------------------------
+
+def tool_list(cfg, args):
+    items = workspaces(cfg)
+    own = own_workspace(items)
+    out = []
+    for w in items:
+        entry = {"workspace": w.get("ref"), "title": w.get("title"), "color": w.get("custom_color"),
+                 "description": w.get("description"),
+                 "folder": tilde(w["current_directory"]) if w.get("current_directory") else None,
+                 "pinned": bool(w.get("pinned")), "selected": bool(w.get("selected"))}
+        if own and w.get("ref") == own:
+            entry["this_session"] = True
+        out.append(entry)
+    return {"workspaces": out}
+
+
+def action(cfg, w, *extra):
+    cmux(cfg, ["workspace-action", *extra, "--workspace", w])
+
+
+def tool_select(cfg, args):
+    w = workspace_arg(cfg, args)
+    cmux(cfg, ["select-workspace", "--workspace", w])
+    return {"selected": w}
+
+
+def tool_rename(cfg, args):
+    w, title = workspace_arg(cfg, args), text_arg(args, "title", 100)
+    action(cfg, w, "--action", "rename", "--title", title)
+    return {"workspace": w, "title": title}
+
+
+def tool_color(cfg, args):
+    w = workspace_arg(cfg, args)
+    if args.get("color") in (None, "", "none"):
+        action(cfg, w, "--action", "clear-color")
+        return {"workspace": w, "color": None}
+    color = color_value(None, args["color"])
+    action(cfg, w, "--action", "set-color", "--color", color)
+    return {"workspace": w, "color": color}
+
+
+def tool_describe(cfg, args):
+    w, text = workspace_arg(cfg, args), text_arg(args, "description", 500, required=False)
+    if text is None:
+        action(cfg, w, "--action", "clear-description")
+    else:
+        action(cfg, w, "--action", "set-description", "--description", text)
+    return {"workspace": w, "description": text}
+
+
+def tool_pin(cfg, args):
+    w = workspace_arg(cfg, args)
+    if not isinstance(args.get("pinned"), bool):
+        raise Refused("pinned must be true or false")
+    action(cfg, w, "--action", "pin" if args["pinned"] else "unpin")
+    return {"workspace": w, "pinned": args["pinned"]}
+
+
+def own_or_refuse(cfg):
+    own = own_workspace(workspaces(cfg))
+    if not own:
+        raise Refused("this session's workspace is unknown: start the agent (or cbox) from a cmux terminal")
+    return own
+
+
+def tool_notify(cfg, args):
+    title, body = text_arg(args, "title", 100), text_arg(args, "body", 500, required=False)
+    own = own_or_refuse(cfg)
+    cmux(cfg, ["notify", "--title", title, *(["--body", body] if body else []), "--workspace", own])
+    return {"notified": True, "workspace": own}
+
+
+def tool_status(cfg, args):
+    key = args.get("key") or "agent"
+    if not isinstance(key, str) or not STATUS_KEY_RE.match(key):
+        raise Refused("key may only contain letters, digits, '_', '.' and '-' (up to 32)")
+    value = text_arg(args, "value", 100, required=False)
+    own = own_or_refuse(cfg)
+    if value is None:
+        cmux(cfg, ["clear-status", key, "--workspace", own])
+    else:
+        cmux(cfg, ["set-status", key, value, "--workspace", own])
+    return {"workspace": own, "key": key, "value": value}
+
+
+def tool_progress(cfg, args):
+    value = args.get("value")
+    label = text_arg(args, "label", 100, required=False)
+    own = own_or_refuse(cfg)
+    if value is None:
+        cmux(cfg, ["clear-progress", "--workspace", own])
+        return {"workspace": own, "progress": None}
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        raise Refused("value must be a number from 0 to 1, or null to clear")
+    cmux(cfg, ["set-progress", f"{float(value):.3f}", *(["--label", label] if label else []), "--workspace", own])
+    return {"workspace": own, "progress": value, "label": label}
+
+
+def tool_close(cfg, args):
+    w = workspace_arg(cfg, args)
+    items = workspaces(cfg)
+    if w in (own_workspace(items), next((x.get("id") for x in items if x.get("ref") == own_workspace(items)), None)):
+        raise Refused("this is the session's own workspace: closing it would end this session")
+    cmux(cfg, ["close-workspace", "--workspace", w])
+    return {"closed": w}
+
+
+WS = {"workspace": {"type": "string", "description": "A ref like workspace:12, from cmux_list"}}
+TOOLS = [
+    ("cmux_list", tool_list, "All cmux workspaces: ref, title, color, description, folder, pinned, selected. "
+     "this_session marks the workspace this session runs in.", {}, []),
+    ("cmux_open", tool_open, "Opens a repository in a new cmux workspace named after it, colored, in "
+     "~/Workspace/<name> (the user's settings may start a command there, e.g. cbox); clones it first when missing. A bare name is enough when the "
+     "user's settings fix the owner.", {
+         "repo": {"type": "string", "description": "name, owner/name, or group/subgroup/name (GitLab)"},
+         "color": {"type": "string", "description": "#RRGGBB or one of: " + ", ".join(COLORS) + " (default: from the name)"},
+         "source": {"type": "string", "description": "a git host from the user's settings, e.g. github or gitlab "
+                    "(default: the first that has the repo)"}}, ["repo"]),
+    ("cmux_select", tool_select, "Switches cmux to a workspace.", WS, ["workspace"]),
+    ("cmux_rename", tool_rename, "Renames a workspace.", dict(WS, title={"type": "string"}), ["workspace", "title"]),
+    ("cmux_color", tool_color, "Sets a workspace's color, or clears it with color null.",
+     dict(WS, color={"type": ["string", "null"], "description": "#RRGGBB or one of: " + ", ".join(COLORS)}),
+     ["workspace"]),
+    ("cmux_describe", tool_describe, "Sets a workspace's description, or clears it with description null.",
+     dict(WS, description={"type": ["string", "null"]}), ["workspace"]),
+    ("cmux_pin", tool_pin, "Pins or unpins a workspace.", dict(WS, pinned={"type": "boolean"}), ["workspace", "pinned"]),
+    ("cmux_notify", tool_notify, "Shows the user a cmux notification from this session's workspace, e.g. when "
+     "a long task is done or input is needed.", {"title": {"type": "string"}, "body": {"type": "string"}}, ["title"]),
+    ("cmux_status", tool_status, "Shows a short status in this session's sidebar entry (e.g. 'tests running'), "
+     "or clears it with value null.", {"value": {"type": ["string", "null"]},
+                                        "key": {"type": "string", "description": "default: agent"}}, []),
+    ("cmux_progress", tool_progress, "Shows a progress bar in this session's sidebar entry, or clears it with "
+     "value null.", {"value": {"type": ["number", "null"], "description": "0 to 1"}, "label": {"type": "string"}}, []),
+    ("cmux_close", tool_close, "Closes a workspace and ends whatever runs in it. Ask the user first.", WS, ["workspace"]),
+]
+EXTRA_TOOLS = {"cmux_close": "close"}
+NOTE = ("cmux tools: the user's terminal app on their Mac. Workspaces are tabs in its sidebar. These tools "
+        "cannot type into terminals or read them.")
+
+
+def tools_for(cfg):
+    return [t for t in TOOLS if t[0] not in EXTRA_TOOLS or (cfg and EXTRA_TOOLS[t[0]] in cfg["allow"])]
+
+
+def tool_specs(cfg):
+    return [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": props, "required": req,
+                                                          "additionalProperties": False}}
+            for n, _, d, props, req in tools_for(cfg)]
+
+
+def call(cfg, name, args):
+    tool = next((t for t in tools_for(cfg) if t[0] == name), None)
+    if not tool:
+        raise Refused(f"unknown tool {name}")
+    if not isinstance(args, dict):
+        raise Refused("arguments must be an object")
+    extra = set(args) - set(tool[3])
+    if extra:
+        raise Refused(f"{name} does not take {', '.join(sorted(extra))}")
+    return tool[1](cfg, args)
+
+
+# --- MCP over stdio --------------------------------------------------------------
+
+def serve(inp=sys.stdin, out=sys.stdout):
+    def reply(mid, **kw):
+        out.write(json.dumps({"jsonrpc": "2.0", "id": mid, **kw}) + "\n")
+        out.flush()
+
+    for raw in inp:
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict) or msg.get("id") is None:
+            continue  # notifications need no answer
+        mid, method, params = msg["id"], msg.get("method"), msg.get("params") or {}
+        try:
+            cfg, problem = load_config(), None
+        except Refused as e:
+            cfg, problem = None, str(e)
+        if method == "initialize":
+            reply(mid, result={"protocolVersion": params.get("protocolVersion") or "2025-06-18",
+                               "capabilities": {"tools": {}},
+                               "serverInfo": {"name": "cmux-safe-mcp", "version": VERSION}, "instructions": NOTE})
+        elif method == "ping":
+            reply(mid, result={})
+        elif method == "tools/list":
+            reply(mid, result={"tools": tool_specs(cfg)})
+        elif method == "tools/call":
+            try:
+                if problem:
+                    raise Refused(problem)
+                text, failed = json.dumps(call(cfg, params.get("name"), params.get("arguments") or {}),
+                                          indent=2, ensure_ascii=False), False
+            except Refused as e:
+                text, failed = str(e), True
+            reply(mid, result={"content": [{"type": "text", "text": text}], "isError": failed})
+        else:
+            reply(mid, error={"code": -32601, "message": f"unknown method {method}"})
+
+
+def check():
+    try:
+        cfg = load_config()
+    except Refused as e:
+        print(f"✖ {e}")
+        return 1
+    print(f"✔ settings: {tilde(config_path())}; repos go to {tilde(cfg['folder'])}")
+    for n, s in cfg["sources"]:
+        print(f"  {n}: {', '.join(patterns(s))}  (clone {s['clone']})")
+    try:
+        items = workspaces(cfg)
+    except Refused as e:
+        print(f"✖ {e}")
+        return 1
+    print(f"✔ cmux answers: {len(items)} workspaces")
+    print(f"  tools: {', '.join(t[0] for t in tools_for(cfg))}")
+    if os.environ.get("CMUX_WORKSPACE_ID"):
+        print("ℹ  This terminal is inside cmux, which cmux lets in anyway. A background process (like\n"
+              "   cbox's relay) may not be: check from another terminal app too.")
+    return 0
+
+
+HELP = """cmux-safe-mcp — only the safe parts of cmux, as an MCP server
+
+Settings: {path}
+
+  [settings]
+  folder  = ~/Workspace           # where repos go (optional)
+  command = cbox                  # optional: run in each opened workspace (e.g. cbox, claude)
+  allow   = close                 # optional: also let the agent close workspaces
+  cmux    = /path/to/cmux         # optional: when cmux is not on the PATH
+
+  [github]                        # a git host; any name, the first one is tried first
+  repos   = my-user/*, my-org/app # owner/name patterns the agent may open
+  clone   = git@github.com:{{repo}}.git   # optional (this is the default)
+
+  [gitlab]
+  repos   = my-group/*            # * also covers subgroups
+  clone   = git@gitlab.com:{{repo}}.git
+
+Add it to your MCP client:
+  Claude Code:  claude mcp add cmux -- {exe}
+  cbox:         ~/.config/claudebox/mcp.json  →  "cmux": {{"command": "{exe}"}}
+
+  cmux-safe-mcp check    tests the settings and the connection to cmux
+"""
+
+
+def main(argv):
+    if argv[1:] == ["check"]:
+        return check()
+    if argv[1:] in (["--version"], ["version"]):
+        print(f"cmux-safe-mcp {VERSION}")
+        return 0
+    if argv[1:] or sys.stdin.isatty():
+        print(HELP.format(path=tilde(config_path()), exe=os.path.realpath(argv[0])))
+        return 0 if argv[1:] in (["--help"], ["-h"], ["help"], []) else 2
+    serve()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
