@@ -10,12 +10,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.x"]
+        include:
+          # 3.9: the python3 that ships with macOS (Command Line Tools)
+          - { os: macos-latest, python: "3.9" }
+          - { os: macos-latest, python: "3.x" }
+          - { os: ubuntu-latest, python: "3.x" }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Unit tests
