@@ -1,0 +1,18 @@
+# cmux-safe-mcp settings: ~/.config/cmux-safe-mcp/config
+# (or the path in $CMUX_SAFE_MCP_CONFIG)
+
+[settings]
+folder  = ~/Workspace            # where repos go (default: ~/Workspace)
+# command = cbox                 # run in each workspace cmux_open opens (e.g. cbox, claude)
+# allow   = close                # also offer cmux_close (never the agent's own workspace)
+# cmux    = /path/to/cmux        # when cmux is not on the PATH
+
+# One section per git host; any name. For a bare repo name, the first host
+# that has the repo wins.
+[github]
+repos   = my-user/*, my-org/app  # owner/name patterns the agent may open
+# clone = git@github.com:{repo}.git   # the default
+
+# [gitlab]
+# repos = my-group/*             # * also covers subgroups (my-group/sub/app)
+# clone = git@gitlab.com:{repo}.git

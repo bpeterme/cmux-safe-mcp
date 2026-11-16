@@ -1,0 +1,25 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.9: the python3 that ships with macOS (Command Line Tools)
+          - { os: macos-latest, python: "3.9" }
+          - { os: macos-latest, python: "3.x" }
+          - { os: ubuntu-latest, python: "3.x" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: bash tests/run.sh
