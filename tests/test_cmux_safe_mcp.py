@@ -394,6 +394,19 @@ class VersionTests(Base):
             self.assertEqual(f.read().count(self.PLACEHOLDER), 1)
         self.assertEqual(m.VERSION, "dev")
 
+    def test_formula_and_release_workflow_match(self):
+        # release.yml rewrites exact lines of the formula; if one drifts, the tap gets a broken formula.
+        def read(*parts):
+            with open(os.path.join(ROOT, *parts)) as f:
+                return f.read()
+        formula = read("Formula", "cmux-safe-mcp.rb")
+        release = read(".github", "workflows", "release.yml")
+        self.assertIn(f"inreplace \"cmux-safe-mcp\", '{self.PLACEHOLDER}',", formula)
+        head_test = 'assert_match "cmux-safe-mcp HEAD-", shell_output("#{bin}/cmux-safe-mcp version")'
+        for line in ('  license "MIT"', head_test):
+            self.assertEqual(formula.count(line), 1, line)
+            self.assertIn(line, release)
+
     def test_unreleased_source_says_dev(self):
         self.assertEqual(self.version_of(SCRIPT), "cmux-safe-mcp dev")
         self.assertEqual(self.server_version_of(SCRIPT), "dev")
