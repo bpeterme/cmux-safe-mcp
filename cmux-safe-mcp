@@ -17,7 +17,7 @@ Mac), and useful for any MCP client. Settings: ~/.config/cmux-safe-mcp/config.
 import configparser, fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile
 from fnmatch import fnmatchcase
 
-VERSION = "0.1.0"
+VERSION = "dev"  # set by the Homebrew formula: the release date (YYYY.MM.DD.N) or HEAD-<sha>
 DEFAULT_FOLDER = "~/Workspace"
 DEFAULT_CLONE = "git@github.com:{repo}.git"
 COLORS = ("Red", "Crimson", "Orange", "Amber", "Olive", "Green", "Teal", "Aqua",
