@@ -39,8 +39,10 @@ SURFACE_RE = re.compile(r"^(surface:\d{1,20}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A
                         r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$")
 COMMAND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 EXTRAS = {"close", "panes"}  # actions that stay off unless listed in allow =
-SETTINGS_KEYS = {"folder", "allow", "cmux", "command", "max_panes"}
+SETTINGS_KEYS = {"folder", "allow", "cmux", "command", "max_panes", "lead_width"}
 DEFAULT_MAX_PANES = 4
+COLUMN_PANES = 4  # panes per column right of the session's own; two columns, so 8 panes at most
+DEFAULT_LEAD_WIDTH = 60  # percent of the window the session's own pane keeps when it opens panes
 # Keys a pane may get, by the name the agent uses: cmux send-key's names.
 KEYS = {"enter": "enter", "escape": "escape", "tab": "tab", "up": "up", "down": "down",
         "ctrl-c": "ctrl-c"}
@@ -98,8 +100,14 @@ def load_config(path=None):
         max_panes = int(s.get("max_panes", DEFAULT_MAX_PANES))
     except ValueError:
         max_panes = -1
-    if not 1 <= max_panes <= 32:
-        raise Refused("[settings] max_panes must be a number from 1 to 32")
+    if not 1 <= max_panes <= 2 * COLUMN_PANES:
+        raise Refused(f"[settings] max_panes must be a number from 1 to {2 * COLUMN_PANES}")
+    try:
+        lead_width = int(s.get("lead_width", DEFAULT_LEAD_WIDTH))
+    except ValueError:
+        lead_width = -1
+    if not 50 <= lead_width <= 90:
+        raise Refused("[settings] lead_width must be a number from 50 to 90 (percent of the window)")
     if "panes" in allow and not commands:
         raise Refused("allow = panes needs a [commands] section: the commands a pane may run, e.g. worker = cbox")
     sources = []
@@ -125,7 +133,8 @@ def load_config(path=None):
         raise Refused("[settings] command must be one line")
     return {"folder": os.path.realpath(folder), "allow": allow, "cmux": s.get("cmux", ""),
             "command": command, "sources": sources,
-            "commands": {n: c.strip() for n, c in commands.items()}, "max_panes": max_panes}
+            "commands": {n: c.strip() for n, c in commands.items()}, "max_panes": max_panes,
+            "lead_width": lead_width}
 
 
 def tilde(path):
@@ -547,9 +556,6 @@ def tool_pane_open(cfg, args):
     name = args.get("command")
     if not isinstance(name, str) or name not in cfg["commands"]:
         raise Refused(f"command must be one of: {', '.join(sorted(cfg['commands']))} (the user's [commands])")
-    direction = args.get("direction") or "right"
-    if direction not in ("right", "down"):
-        raise Refused("direction must be right or down")
     label = text_arg(args, "label", 60, required=False)
     surface, own = own_surface(), own_or_refuse(cfg)
     with Lock():
@@ -559,20 +565,70 @@ def tool_pane_open(cfg, args):
         if len(panes) >= cfg["max_panes"]:
             raise Refused(f"{len(panes)} panes are open, the most the user allows (max_panes = {cfg['max_panes']}) "
                           "— close one first (cmux_pane_close)")
+        # The lead keeps its full height. Its panes fill a column right of it, up to
+        # COLUMN_PANES, then a second one; each new pane splits the tallest pane of
+        # its column (the oldest on a tie). An empty column opens right of the lead.
+        cols = {1: [], 2: []}
+        for ref, rec in panes.items():
+            if rec.get("owner") == surface:
+                cols[2 if rec.get("column") == 2 else 1].append((ref, rec))
+        column = 1 if len(cols[1]) < COLUMN_PANES else 2
+        if cols[column]:
+            ref, base = min(cols[column], key=lambda p: p[1].get("splits", 0))
+            base["splits"] = base.get("splits", 0) + 1
+            where, splits = ["down", "--workspace", own, "--surface", ref], base["splits"]
+        else:
+            where, splits = ["right", "--workspace", own, "--surface", surface], 0
         # The command comes from the user's settings only. exec: the pane closes when it ends.
-        out = cmux(cfg, ["new-split", direction, "--workspace", own, "--surface", surface,
-                         "--command", f"exec {cfg['commands'][name]} || exit"])
+        out = cmux(cfg, ["new-split", *where, "--command", f"exec {cfg['commands'][name]} || exit"])
         m = re.search(r"\bsurface:\d+\b", out)
         if not m:
             raise Refused(f"cmux new-split gave no pane: {out[-300:] or 'no output'}")
-        panes[m.group(0)] = {"owner": surface, "workspace": own, "command": name, "label": label}
+        panes[m.group(0)] = {"owner": surface, "workspace": own, "command": name, "label": label,
+                             "column": column, "splits": splits}
         save_panes(panes)
+        mine = {ref: rec.get("column", 1) for ref, rec in panes.items() if rec.get("owner") == surface}
     if label:
         try:
             cmux(cfg, ["rename-tab", "--workspace", own, "--surface", m.group(0), label])
         except Refused:
             pass  # the label is a nicety
+    fit_layout(cfg, own, surface, mine)
     return {"pane": m.group(0), "command": name, "label": label}
+
+
+def fit_layout(cfg, own, surface, mine):
+    """Sizes the columns: with one column of panes, the session's own pane gets at
+    least lead_width percent of the window; with two, it and the column next to it
+    get a third each. mine maps the session's panes to their column. cmux reports
+    widths and resizes in points. A nicety: any problem leaves the layout as it is."""
+    two = len(set(mine.values())) > 1
+
+    def layout():
+        data = json.loads(cmux(cfg, ["list-panes", "--workspace", own, "--json"]))
+        return float(data["container_frame"]["width"]), data["panes"]
+
+    def surfaces(p):
+        return (p.get("surface_refs") or []) + (p.get("surface_ids") or [])
+
+    def fit(p, target, shrink):
+        delta = int(target - float(p["pixel_frame"]["width"]))
+        if abs(delta) < float(p.get("cell_width_points") or 8) or (delta < 0 and not shrink):
+            return  # within a column of the target, or wider than asked
+        cmux(cfg, ["resize-pane", "--workspace", own, "--pane", p["ref"], "-R" if delta > 0 else "-L",
+                   "--amount", str(abs(delta))])
+
+    try:
+        total, items = layout()
+        lead = next(p for p in items if surface in surfaces(p))
+        fit(lead, total / 3 if two else total * cfg["lead_width"] / 100, shrink=two)
+        if two:  # the column right next to the lead
+            total, items = layout()
+            near = min((p for p in items if set(surfaces(p)) & set(mine)),
+                       key=lambda p: float(p["pixel_frame"]["x"]))
+            fit(near, total / 3, shrink=True)
+    except (Refused, ValueError, KeyError, TypeError, StopIteration):
+        pass
 
 
 def tool_pane_list(cfg, args):
@@ -583,12 +639,17 @@ def tool_pane_list(cfg, args):
             save_panes(panes)
     mine = [{"pane": ref, "command": rec.get("command"), "label": rec.get("label")}
             for ref, rec in sorted(panes.items()) if rec.get("owner") == surface]
-    return {"panes": mine, "open": len(panes), "max_panes": cfg["max_panes"]}
+    return {"panes": mine, "commands": sorted(cfg["commands"]), "open": len(panes), "max_panes": cfg["max_panes"]}
 
 
 def tool_pane_send(cfg, args):
     ref, rec = owned_pane(cfg, args)
     text = text_arg(args, "text", 4000)
+    # cmux send types the two characters \n and \r as Enter and \t as Tab, with
+    # no way to escape them: refuse rather than press keys the agent did not ask for.
+    if any(e in text for e in ("\\n", "\\r", "\\t")):
+        raise Refused("text must not contain \\n, \\r or \\t: cmux types them as Enter or Tab "
+                      "— send one line, and press keys with cmux_pane_key")
     enter = args.get("enter", True)
     if not isinstance(enter, bool):
         raise Refused("enter must be true or false")
@@ -658,15 +719,14 @@ TOOLS = [
     ("cmux_progress", tool_progress, "Shows a progress bar in this session's sidebar entry, or clears it with "
      "value null.", {"value": {"type": ["number", "null"], "description": "0 to 1"}, "label": {"type": "string"}}, []),
     ("cmux_close", tool_close, "Closes a workspace and ends whatever runs in it. Ask the user first.", WS, ["workspace"]),
-    ("cmux_pane_open", tool_pane_open, "Opens a pane next to this session's that runs one of the user's named "
-     "commands (e.g. another agent). The pane closes when the command ends.", {
+    ("cmux_pane_open", tool_pane_open, "Opens a pane right of this session's that runs one of the user's named "
+     "commands (e.g. another agent); more panes stack in that column. The pane closes when the command ends.", {
          "command": {"type": "string", "description": "a name from the user's [commands], see cmux_pane_list"},
-         "direction": {"type": "string", "enum": ["right", "down"], "description": "default: right"},
          "label": {"type": "string", "description": "a tab title, e.g. the task"}}, ["command"]),
-    ("cmux_pane_list", tool_pane_list, "The panes this session opened that still exist, how many are open on "
-     "this Mac, and the most the user allows.", {}, []),
+    ("cmux_pane_list", tool_pane_list, "The panes this session opened that still exist, the command names "
+     "cmux_pane_open takes, how many panes are open on this Mac, and the most the user allows.", {}, []),
     ("cmux_pane_send", tool_pane_send, "Types one line into a pane this session opened, then Enter (unless "
-     "enter is false).", dict(PANE, text={"type": "string"}, enter={"type": "boolean"}), ["pane", "text"]),
+     "enter is false). No \\n, \\r or \\t in the text.", dict(PANE, text={"type": "string"}, enter={"type": "boolean"}), ["pane", "text"]),
     ("cmux_pane_key", tool_pane_key, "Presses a key in a pane this session opened, e.g. ctrl-c or escape.",
      dict(PANE, key={"type": "string", "enum": list(KEYS)}), ["pane", "key"]),
     ("cmux_pane_read", tool_pane_read, "The last lines on the screen of a pane this session opened.",
@@ -760,7 +820,7 @@ def check():
     print(f"✔ cmux answers: {len(items)} workspaces")
     print(f"  tools: {', '.join(t[0] for t in tools_for(cfg))}")
     if "panes" in cfg["allow"]:
-        print(f"  panes: up to {cfg['max_panes']}, commands: "
+        print(f"  panes: up to {cfg['max_panes']}, this pane keeps {cfg['lead_width']}% of the width, commands: "
               + ", ".join(f"{n} = {c}" for n, c in sorted(cfg["commands"].items())))
     if os.environ.get("CMUX_WORKSPACE_ID"):
         print("ℹ  This terminal is inside cmux, which cmux lets in anyway. A background process (like\n"

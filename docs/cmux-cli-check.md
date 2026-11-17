@@ -1,0 +1,79 @@
+# cmux CLI check for the pane tools
+
+The pane tools (`allow = panes`) call the cmux CLI with the exact arguments
+below. The tests pin them with a fake cmux (`PaneTests` in
+`tests/test_cmux_safe_mcp.py`); this page checks them against a real cmux.
+
+## What each tool runs
+
+`<ws>` is the session's workspace ref (`workspace:N`), `<own>` its own pane
+(`CMUX_SURFACE_ID`), `<p>` a pane the session opened (`surface:N`).
+
+| Tool | cmux call |
+|------|-----------|
+| `cmux_pane_open` (first pane) | `new-split right --workspace <ws> --surface <own> --command "exec <command> \|\| exit"` |
+| `cmux_pane_open` (more panes) | `new-split down --workspace <ws> --surface <tallest pane of the column> --command ...`: up to 4 per column; the fifth pane starts a second column with `new-split right` from the session's pane |
+| `cmux_pane_open` (then) | `list-panes --workspace <ws> --json`; one column: if the session's pane is narrower than `lead_width` % of `container_frame.width`, `resize-pane --workspace <ws> --pane <its pane> -R --amount <points short>`; two columns: the session's pane and then the column next to it to a third each, `-R` to grow, `-L` to shrink |
+| `cmux_pane_open` (with `label`) | then `rename-tab --workspace <ws> --surface <p> <label>` |
+| `cmux_pane_send` | `send --workspace <ws> --surface <p> <text>`, then `send-key ... enter` (unless `enter` is false) |
+| `cmux_pane_key` | `send-key --workspace <ws> --surface <p> enter\|escape\|tab\|up\|down\|ctrl-c` |
+| `cmux_pane_read` | `read-screen --workspace <ws> --surface <p> --lines <1-200>` |
+| `cmux_pane_close` | `close-surface --workspace <ws> --surface <p> --force` |
+| (every pane tool) | `read-screen --workspace <ws> --surface <p> --lines 1` to see if a pane still exists |
+
+## Checked against the cmux source (2026-11-17)
+
+Checked in `CLI/cmux.swift`, `CLI/CMUXCLI+Paste.swift` and
+`Packages/macOS/CmuxTerminal/.../TerminalSurface+Input.swift` of
+`manaflow-ai/cmux` (main). The docs page (cmux.com/docs/api) lists only
+`send`, `send-key` and `new-split`.
+
+- All six commands take `--workspace` and `--surface`.
+- `close-surface --force` exists (sent as `force` to `surface.close`).
+- Key names: `enter`, `escape`, `tab`, `up`, `down` and `ctrl-c` are all in
+  cmux's key table (it also accepts `esc`, `ctrl+c` and others).
+- `new-split` prints `OK surface:N workspace:N`; `--command` runs the
+  command in a shell that stays open, hence `exec ... || exit`.
+- `rename-tab` takes the title as the last argument (or `--title`).
+- `read-screen --lines N` returns the last N lines, scrollback included.
+- `send` and `send-key` without `--force` refuse to type into an agent
+  prompt that holds a draft or an open question. The pane tools never pass
+  `--force`, so this check applies to them.
+- `send` turns the two characters `\n` and `\r` into Enter and `\t` into
+  Tab, and offers no way to escape them. `cmux_pane_send` therefore refuses
+  text that contains them.
+
+## Checklist on the Mac
+
+Run these in a cmux terminal, one at a time, and compare with the expected
+result in the comment. In the `WS=` and `P=` lines, replace `workspace:3` and
+`surface:7` with the refs the command just above prints.
+
+```sh
+cmux list-workspaces                                                            # the selected line has this workspace's ref
+WS=workspace:3
+cmux new-split right --workspace "$WS" --surface "$CMUX_SURFACE_ID" --command "exec zsh || exit"   # a pane opens; prints OK surface:N workspace:N
+P=surface:7
+cmux --json list-panes --workspace "$WS"                                       # container_frame.width and each pane's pixel_frame.width, in points
+cmux resize-pane --workspace "$WS" --pane pane:1 -R --amount 100              # use your pane's ref from above: its right edge moves about 100 points
+cmux resize-pane --workspace "$WS" --pane pane:1 -L --amount 100              # and back: -L moves the right edge left
+cmux new-split down --workspace "$WS" --surface "$P" --command "exec zsh || exit"         # a second pane opens below it; yours keeps its full height
+cmux close-surface --workspace "$WS" --surface surface:8 --force               # use the ref it printed; the first pane is full height again
+cmux rename-tab --workspace "$WS" --surface "$P" cli-check                      # the new pane's tab reads cli-check
+cmux send --workspace "$WS" --surface "$P" "echo hello"                         # echo hello typed, not run
+cmux send-key --workspace "$WS" --surface "$P" enter                            # it runs: hello
+cmux send-key --workspace "$WS" --surface "$P" up                               # echo hello is back on the prompt
+cmux send-key --workspace "$WS" --surface "$P" escape                           # no error
+cmux send-key --workspace "$WS" --surface "$P" ctrl-c                           # the prompt line is dropped (^C)
+cmux send --workspace "$WS" --surface "$P" "ech"                                # ech typed
+cmux send-key --workspace "$WS" --surface "$P" tab                              # completes to echo (or lists matches)
+cmux send-key --workspace "$WS" --surface "$P" down                             # no error
+cmux send-key --workspace "$WS" --surface "$P" ctrl-c                           # the prompt is empty again
+cmux send --workspace "$WS" --surface "$P" 'echo a\nb'                          # runs "echo a" at once: why pane_send refuses \n
+cmux read-screen --workspace "$WS" --surface "$P" --lines 5                     # the last 5 lines of the pane
+cmux close-surface --workspace "$WS" --surface "$P" --force                     # the pane closes
+cmux read-screen --workspace "$WS" --surface "$P" --lines 1                     # fails: surface not found
+```
+
+If a line does not do what its comment says, note the line and cmux's output:
+the pane tool that uses that call needs a fix.

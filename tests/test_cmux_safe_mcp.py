@@ -26,6 +26,7 @@ FAKE_CMUX = textwrap.dedent("""\
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "cmux.log"), "a") as f:
         f.write(json.dumps({"argv": sys.argv[1:], "ws": os.environ.get("CMUX_WORKSPACE_ID"),
+                            "sf": os.environ.get("CMUX_SURFACE_ID"),
                             "quiet": os.environ.get("CMUX_QUIET")}) + "\\n")
     if os.path.exists(os.path.join(here, "cmux.fail")):
         sys.stderr.write("Error: ERROR: Access denied - only processes started inside cmux can connect\\n")
@@ -49,6 +50,9 @@ FAKE_CMUX = textwrap.dedent("""\
         print("OK")
     elif sys.argv[1] == "list-workspaces":
         print(open(os.path.join(here, "list.json")).read())
+    elif sys.argv[1] == "list-panes":
+        layout = os.path.join(here, "panes-layout.json")
+        print(open(layout).read() if os.path.exists(layout) else "Error: no layout")
     else:
         print("OK")
     """)
@@ -152,7 +156,8 @@ class ListTests(Base):
     def test_cmux_gets_no_caller_workspace_and_is_quiet(self):
         os.environ["CMUX_WORKSPACE_ID"] = OWN_ID
         self.call("cmux_list")
-        self.assertEqual(self.calls()[0], {"argv": ["list-workspaces", "--json"], "ws": None, "quiet": "1"})
+        self.assertEqual(self.calls()[0], {"argv": ["list-workspaces", "--json"], "ws": None, "sf": None,
+                                            "quiet": "1"})
 
     def test_refused_socket_access_says_what_to_do(self):
         open(os.path.join(self.t, "cmux.fail"), "w").close()
@@ -349,15 +354,104 @@ class PaneTests(Base):
         self.assertIn("needs a [commands] section", str(cm.exception))
 
     def test_open_runs_only_a_named_command_next_to_the_own_pane(self):
-        out = self.call("cmux_pane_open", {"command": "worker", "direction": "down", "label": "fix-12"})
+        out = self.call("cmux_pane_open", {"command": "worker", "label": "fix-12"})
         self.assertEqual(out, {"pane": "surface:100", "command": "worker", "label": "fix-12"})
-        self.assertEqual(self.argv("new-split"), [["new-split", "down", "--workspace", "workspace:1", "--surface",
+        self.assertEqual(self.argv("new-split"), [["new-split", "right", "--workspace", "workspace:1", "--surface",
                                                    LEAD, "--command", "exec cbox --worker || exit"]])
         self.assertEqual(self.argv("rename-tab"), [["rename-tab", "--workspace", "workspace:1", "--surface",
                                                     "surface:100", "fix-12"]])
         self.assertIn("command must be one of: shell, worker", self.refused("cmux_pane_open", {"command": "rm -rf ~"}))
         self.assertIn("does not take", self.refused("cmux_pane_open", {"command": "worker", "cwd": "/"}))
-        self.refused("cmux_pane_open", {"command": "worker", "direction": "left"})
+        self.assertIn("does not take", self.refused("cmux_pane_open", {"command": "worker", "direction": "down"}))
+
+    def test_lead_keeps_full_height_and_half_the_width(self):
+        self.write_config(settings=PANES.replace("max_panes = 2", "max_panes = 4"))
+        a, b, c, d = (self.call("cmux_pane_open", {"command": "worker"})["pane"] for _ in range(4))
+        # First right of the lead, then down in that column, always splitting the tallest pane.
+        self.assertEqual([(x[1], x[5]) for x in self.argv("new-split")],
+                         [("right", LEAD), ("down", a), ("down", a), ("down", b)])
+        self.assertEqual((a, b, c, d), ("surface:100", "surface:101", "surface:102", "surface:103"))
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(f"{a}\n{b}\n{c}\n{d}\n")
+        self.call("cmux_pane_open", {"command": "worker"})  # all gone: right of the lead again
+        self.assertEqual(self.argv("new-split")[-1][1:6:4], ["right", LEAD])
+
+    def layout(self, lead_width, lead="surface:7"):
+        with open(os.path.join(self.t, "panes-layout.json"), "w") as f:
+            json.dump({"container_frame": {"width": 1353.55, "height": 1052}, "panes": [
+                {"ref": "pane:1", "surface_refs": [lead], "cell_width_points": 8,
+                 "pixel_frame": {"width": lead_width, "x": 0}},
+                {"ref": "pane:2", "surface_refs": ["surface:100"], "cell_width_points": 8,
+                 "pixel_frame": {"width": 1353.55 - lead_width, "x": lead_width}},
+                {"ref": "pane:3", "dock_scope": "global", "surface_refs": []}]}, f)
+
+    def test_lead_is_widened_to_lead_width(self):
+        self.layout(676.3)
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("list-panes"), [["list-panes", "--workspace", "workspace:1", "--json"]])
+        # 60% of 1353.55 is 812.1: 135 points short.
+        self.assertEqual(self.argv("resize-pane"), [["resize-pane", "--workspace", "workspace:1", "--pane", "pane:1",
+                                                     "-R", "--amount", "135"]])
+
+    def test_lead_is_left_alone_when_wide_enough_or_unknown(self):
+        for case in ("wide", "less than a column", "not found", "no layout", "bad json"):
+            if case == "wide":
+                self.layout(900)
+            elif case == "less than a column":
+                self.layout(806)
+            elif case == "not found":
+                self.layout(676.3, lead="surface:55")
+            elif case == "no layout":
+                os.remove(os.path.join(self.t, "panes-layout.json"))
+            else:
+                with open(os.path.join(self.t, "panes-layout.json"), "w") as f:
+                    f.write('{"panes": 3}')
+            p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+            self.assertEqual(self.argv("resize-pane"), [], case)
+            self.call("cmux_pane_close", {"pane": p})
+
+    def test_lead_width_setting(self):
+        self.write_config(settings=PANES.replace("[commands]", "lead_width = 75\n            [commands]"))
+        self.layout(676.3)
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("resize-pane")[0][-1], "338")  # 75% of 1353.55 = 1015.2
+        for bad in ("49", "91", "wide"):
+            self.write_config(settings=PANES.replace("[commands]", f"lead_width = {bad}\n            [commands]"))
+            with self.assertRaises(m.Refused) as cm:
+                m.load_config()
+            self.assertIn("lead_width must be a number from 50 to 90", str(cm.exception))
+
+    def test_two_columns_of_four_at_most(self):
+        self.write_config(settings=PANES.replace("max_panes = 2", "max_panes = 8"))
+        p = [self.call("cmux_pane_open", {"command": "worker"})["pane"] for _ in range(8)]
+        # Column 1 fills to four, then a second column opens right of the lead.
+        self.assertEqual([(x[1], x[5]) for x in self.argv("new-split")],
+                         [("right", LEAD), ("down", p[0]), ("down", p[0]), ("down", p[1]),
+                          ("right", LEAD), ("down", p[4]), ("down", p[4]), ("down", p[5])])
+        self.assertIn("max_panes = 8", self.refused("cmux_pane_open", {"command": "worker"}))
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(p[2] + "\n")  # a pane of column 1 ends: the next one goes there again
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("new-split")[-1][1:6:4], ["down", p[0]])
+
+    def test_two_columns_take_a_third_each(self):
+        self.write_config(settings=PANES.replace("max_panes = 2", "max_panes = 8"))
+        with open(os.path.join(self.t, "panes-layout.json"), "w") as f:
+            json.dump({"container_frame": {"width": 1353.55}, "panes": [
+                {"ref": "pane:1", "surface_refs": [LEAD], "pixel_frame": {"width": 812.1, "x": 0}},
+                {"ref": "pane:6", "surface_refs": ["surface:104"], "pixel_frame": {"width": 270, "x": 812.1}},
+                {"ref": "pane:2", "surface_refs": ["surface:100"], "pixel_frame": {"width": 271.4, "x": 1082.1}}]}, f)
+        for _ in range(4):
+            self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("resize-pane"), [])  # one column: the lead is wide enough
+        self.assertEqual(self.call("cmux_pane_open", {"command": "worker"})["pane"], "surface:104")
+        # A third of 1353.55 is 451.2: the lead gives 360 points, the column next to it gets 181.
+        self.assertEqual(self.argv("resize-pane"), [
+            ["resize-pane", "--workspace", "workspace:1", "--pane", "pane:1", "-L", "--amount", "360"],
+            ["resize-pane", "--workspace", "workspace:1", "--pane", "pane:6", "-R", "--amount", "181"]])
+
+    def test_list_names_the_commands(self):
+        self.assertEqual(self.call("cmux_pane_list")["commands"], ["shell", "worker"])
 
     def test_send_key_read_close_act_on_own_panes(self):
         p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
@@ -371,6 +465,46 @@ class PaneTests(Base):
         self.assertIn(["read-screen"] + target + ["--lines", "20"], self.argv("read-screen"))
         self.assertEqual(self.call("cmux_pane_close", {"pane": p}), {"closed": p})
         self.assertEqual(self.argv("close-surface"), [["close-surface"] + target + ["--force"]])
+        self.assertEqual(self.call("cmux_pane_list")["panes"], [])
+
+    # The exact cmux argv of every pane tool, checked against the cmux CLI source
+    # (docs/cmux-cli-check.md has the matching checklist for a real cmux).
+    def test_exact_cmux_argv_per_pane_tool(self):
+        p = self.call("cmux_pane_open", {"command": "shell"})["pane"]
+        self.assertEqual(self.argv("new-split"), [["new-split", "right", "--workspace", "workspace:1", "--surface",
+                                                   LEAD, "--command", "exec zsh || exit"]])
+        self.assertEqual(self.argv("rename-tab"), [])  # no label, no rename
+        target = ["--workspace", "workspace:1", "--surface", p]
+        self.call("cmux_pane_list")
+        self.assertEqual(self.argv("read-screen"), [["read-screen"] + target + ["--lines", "1"]])  # still there?
+        self.assertEqual(m.KEYS, {"enter": "enter", "escape": "escape", "tab": "tab", "up": "up", "down": "down",
+                                  "ctrl-c": "ctrl-c"})
+        for key in m.KEYS:
+            self.call("cmux_pane_key", {"pane": p, "key": key})
+        self.assertEqual(self.argv("send-key"), [["send-key"] + target + [k] for k in m.KEYS.values()])
+        self.call("cmux_pane_read", {"pane": p})
+        self.assertEqual(self.argv("read-screen")[-1], ["read-screen"] + target + ["--lines", "50"])
+        self.call("cmux_pane_close", {"pane": p})
+        self.assertEqual(self.argv("close-surface"), [["close-surface"] + target + ["--force"]])
+        # No --force on send or send-key: cmux then refuses to type into an agent's half-written prompt.
+        self.assertFalse([c for c in self.calls() if c["argv"][0] in ("send", "send-key") and "--force" in c["argv"]])
+        # No default targets: cmux gets neither the caller's workspace nor its pane.
+        self.assertEqual({(c["ws"], c["sf"]) for c in self.calls()}, {(None, None)})
+
+    def test_send_refuses_what_cmux_would_type_as_keys(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        n = len(self.calls())
+        for text in ["printf 'a\\nb'", "a\\rb", "a\\tb"]:
+            self.assertIn("cmux types them as Enter or Tab", self.refused("cmux_pane_send", {"pane": p, "text": text}))
+        self.assertEqual(len(self.calls()), n)
+        self.call("cmux_pane_send", {"pane": p, "text": "dir C:\\Users"})  # other backslashes pass
+        self.assertEqual(self.argv("send")[-1][-1], "dir C:\\Users")
+
+    def test_close_of_a_pane_that_is_already_gone(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(p + "\n")
+        self.assertEqual(self.call("cmux_pane_close", {"pane": p}), {"closed": p})
         self.assertEqual(self.call("cmux_pane_list")["panes"], [])
 
     def test_arguments_are_checked(self):
@@ -411,6 +545,7 @@ class PaneTests(Base):
 
     def test_settings_problems(self):
         for settings, want in [("allow = panes\nmax_panes = 0\n[commands]\nw = x", "max_panes must be"),
+                               ("allow = panes\nmax_panes = 9\n[commands]\nw = x", "from 1 to 8"),
                                ("allow = panes\n[commands]\nW! = x", "[commands] w!: a name"),
                                ("allow = panes\n[commands]\nw =", "[commands] w must be one command")]:
             self.write_config(settings=settings)
