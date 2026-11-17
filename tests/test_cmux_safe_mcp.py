@@ -26,6 +26,7 @@ FAKE_CMUX = textwrap.dedent("""\
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "cmux.log"), "a") as f:
         f.write(json.dumps({"argv": sys.argv[1:], "ws": os.environ.get("CMUX_WORKSPACE_ID"),
+                            "sf": os.environ.get("CMUX_SURFACE_ID"),
                             "quiet": os.environ.get("CMUX_QUIET")}) + "\\n")
     if os.path.exists(os.path.join(here, "cmux.fail")):
         sys.stderr.write("Error: ERROR: Access denied - only processes started inside cmux can connect\\n")
@@ -152,7 +153,8 @@ class ListTests(Base):
     def test_cmux_gets_no_caller_workspace_and_is_quiet(self):
         os.environ["CMUX_WORKSPACE_ID"] = OWN_ID
         self.call("cmux_list")
-        self.assertEqual(self.calls()[0], {"argv": ["list-workspaces", "--json"], "ws": None, "quiet": "1"})
+        self.assertEqual(self.calls()[0], {"argv": ["list-workspaces", "--json"], "ws": None, "sf": None,
+                                            "quiet": "1"})
 
     def test_refused_socket_access_says_what_to_do(self):
         open(os.path.join(self.t, "cmux.fail"), "w").close()
@@ -371,6 +373,46 @@ class PaneTests(Base):
         self.assertIn(["read-screen"] + target + ["--lines", "20"], self.argv("read-screen"))
         self.assertEqual(self.call("cmux_pane_close", {"pane": p}), {"closed": p})
         self.assertEqual(self.argv("close-surface"), [["close-surface"] + target + ["--force"]])
+        self.assertEqual(self.call("cmux_pane_list")["panes"], [])
+
+    # The exact cmux argv of every pane tool, checked against the cmux CLI source
+    # (docs/cmux-cli-check.md has the matching checklist for a real cmux).
+    def test_exact_cmux_argv_per_pane_tool(self):
+        p = self.call("cmux_pane_open", {"command": "shell"})["pane"]
+        self.assertEqual(self.argv("new-split"), [["new-split", "right", "--workspace", "workspace:1", "--surface",
+                                                   LEAD, "--command", "exec zsh || exit"]])
+        self.assertEqual(self.argv("rename-tab"), [])  # no label, no rename
+        target = ["--workspace", "workspace:1", "--surface", p]
+        self.call("cmux_pane_list")
+        self.assertEqual(self.argv("read-screen"), [["read-screen"] + target + ["--lines", "1"]])  # still there?
+        self.assertEqual(m.KEYS, {"enter": "enter", "escape": "escape", "tab": "tab", "up": "up", "down": "down",
+                                  "ctrl-c": "ctrl-c"})
+        for key in m.KEYS:
+            self.call("cmux_pane_key", {"pane": p, "key": key})
+        self.assertEqual(self.argv("send-key"), [["send-key"] + target + [k] for k in m.KEYS.values()])
+        self.call("cmux_pane_read", {"pane": p})
+        self.assertEqual(self.argv("read-screen")[-1], ["read-screen"] + target + ["--lines", "50"])
+        self.call("cmux_pane_close", {"pane": p})
+        self.assertEqual(self.argv("close-surface"), [["close-surface"] + target + ["--force"]])
+        # No --force on send or send-key: cmux then refuses to type into an agent's half-written prompt.
+        self.assertFalse([c for c in self.calls() if c["argv"][0] in ("send", "send-key") and "--force" in c["argv"]])
+        # No default targets: cmux gets neither the caller's workspace nor its pane.
+        self.assertEqual({(c["ws"], c["sf"]) for c in self.calls()}, {(None, None)})
+
+    def test_send_refuses_what_cmux_would_type_as_keys(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        n = len(self.calls())
+        for text in ["printf 'a\\nb'", "a\\rb", "a\\tb"]:
+            self.assertIn("cmux types them as Enter or Tab", self.refused("cmux_pane_send", {"pane": p, "text": text}))
+        self.assertEqual(len(self.calls()), n)
+        self.call("cmux_pane_send", {"pane": p, "text": "dir C:\\Users"})  # other backslashes pass
+        self.assertEqual(self.argv("send")[-1][-1], "dir C:\\Users")
+
+    def test_close_of_a_pane_that_is_already_gone(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(p + "\n")
+        self.assertEqual(self.call("cmux_pane_close", {"pane": p}), {"closed": p})
         self.assertEqual(self.call("cmux_pane_list")["panes"], [])
 
     def test_arguments_are_checked(self):

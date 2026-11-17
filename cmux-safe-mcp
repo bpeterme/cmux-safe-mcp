@@ -589,6 +589,11 @@ def tool_pane_list(cfg, args):
 def tool_pane_send(cfg, args):
     ref, rec = owned_pane(cfg, args)
     text = text_arg(args, "text", 4000)
+    # cmux send types the two characters \n and \r as Enter and \t as Tab, with
+    # no way to escape them: refuse rather than press keys the agent did not ask for.
+    if any(e in text for e in ("\\n", "\\r", "\\t")):
+        raise Refused("text must not contain \\n, \\r or \\t: cmux types them as Enter or Tab "
+                      "— send one line, and press keys with cmux_pane_key")
     enter = args.get("enter", True)
     if not isinstance(enter, bool):
         raise Refused("enter must be true or false")
@@ -666,7 +671,7 @@ TOOLS = [
     ("cmux_pane_list", tool_pane_list, "The panes this session opened that still exist, how many are open on "
      "this Mac, and the most the user allows.", {}, []),
     ("cmux_pane_send", tool_pane_send, "Types one line into a pane this session opened, then Enter (unless "
-     "enter is false).", dict(PANE, text={"type": "string"}, enter={"type": "boolean"}), ["pane", "text"]),
+     "enter is false). No \\n, \\r or \\t in the text.", dict(PANE, text={"type": "string"}, enter={"type": "boolean"}), ["pane", "text"]),
     ("cmux_pane_key", tool_pane_key, "Presses a key in a pane this session opened, e.g. ctrl-c or escape.",
      dict(PANE, key={"type": "string", "enum": list(KEYS)}), ["pane", "key"]),
     ("cmux_pane_read", tool_pane_read, "The last lines on the screen of a pane this session opened.",
