@@ -351,15 +351,30 @@ class PaneTests(Base):
         self.assertIn("needs a [commands] section", str(cm.exception))
 
     def test_open_runs_only_a_named_command_next_to_the_own_pane(self):
-        out = self.call("cmux_pane_open", {"command": "worker", "direction": "down", "label": "fix-12"})
+        out = self.call("cmux_pane_open", {"command": "worker", "label": "fix-12"})
         self.assertEqual(out, {"pane": "surface:100", "command": "worker", "label": "fix-12"})
-        self.assertEqual(self.argv("new-split"), [["new-split", "down", "--workspace", "workspace:1", "--surface",
+        self.assertEqual(self.argv("new-split"), [["new-split", "right", "--workspace", "workspace:1", "--surface",
                                                    LEAD, "--command", "exec cbox --worker || exit"]])
         self.assertEqual(self.argv("rename-tab"), [["rename-tab", "--workspace", "workspace:1", "--surface",
                                                     "surface:100", "fix-12"]])
         self.assertIn("command must be one of: shell, worker", self.refused("cmux_pane_open", {"command": "rm -rf ~"}))
         self.assertIn("does not take", self.refused("cmux_pane_open", {"command": "worker", "cwd": "/"}))
-        self.refused("cmux_pane_open", {"command": "worker", "direction": "left"})
+        self.assertIn("does not take", self.refused("cmux_pane_open", {"command": "worker", "direction": "down"}))
+
+    def test_lead_keeps_full_height_and_half_the_width(self):
+        self.write_config(settings=PANES.replace("max_panes = 2", "max_panes = 4"))
+        a, b, c, d = (self.call("cmux_pane_open", {"command": "worker"})["pane"] for _ in range(4))
+        # First right of the lead, then down in that column, always splitting the tallest pane.
+        self.assertEqual([(x[1], x[5]) for x in self.argv("new-split")],
+                         [("right", LEAD), ("down", a), ("down", a), ("down", b)])
+        self.assertEqual((a, b, c, d), ("surface:100", "surface:101", "surface:102", "surface:103"))
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(f"{a}\n{b}\n{c}\n{d}\n")
+        self.call("cmux_pane_open", {"command": "worker"})  # all gone: right of the lead again
+        self.assertEqual(self.argv("new-split")[-1][1:6:4], ["right", LEAD])
+
+    def test_list_names_the_commands(self):
+        self.assertEqual(self.call("cmux_pane_list")["commands"], ["shell", "worker"])
 
     def test_send_key_read_close_act_on_own_panes(self):
         p = self.call("cmux_pane_open", {"command": "worker"})["pane"]

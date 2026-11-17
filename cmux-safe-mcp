@@ -547,9 +547,6 @@ def tool_pane_open(cfg, args):
     name = args.get("command")
     if not isinstance(name, str) or name not in cfg["commands"]:
         raise Refused(f"command must be one of: {', '.join(sorted(cfg['commands']))} (the user's [commands])")
-    direction = args.get("direction") or "right"
-    if direction not in ("right", "down"):
-        raise Refused("direction must be right or down")
     label = text_arg(args, "label", 60, required=False)
     surface, own = own_surface(), own_or_refuse(cfg)
     with Lock():
@@ -559,13 +556,23 @@ def tool_pane_open(cfg, args):
         if len(panes) >= cfg["max_panes"]:
             raise Refused(f"{len(panes)} panes are open, the most the user allows (max_panes = {cfg['max_panes']}) "
                           "— close one first (cmux_pane_close)")
+        # The lead keeps its full height and at least half the width: the first pane
+        # opens right of it, later ones stack in that column, each splitting the
+        # tallest pane there (the oldest on a tie).
+        mine = [(ref, rec) for ref, rec in panes.items() if rec.get("owner") == surface]
+        if mine:
+            ref, base = min(mine, key=lambda p: p[1].get("splits", 0))
+            base["splits"] = base.get("splits", 0) + 1
+            where, splits = ["down", "--workspace", own, "--surface", ref], base["splits"]
+        else:
+            where, splits = ["right", "--workspace", own, "--surface", surface], 0
         # The command comes from the user's settings only. exec: the pane closes when it ends.
-        out = cmux(cfg, ["new-split", direction, "--workspace", own, "--surface", surface,
-                         "--command", f"exec {cfg['commands'][name]} || exit"])
+        out = cmux(cfg, ["new-split", *where, "--command", f"exec {cfg['commands'][name]} || exit"])
         m = re.search(r"\bsurface:\d+\b", out)
         if not m:
             raise Refused(f"cmux new-split gave no pane: {out[-300:] or 'no output'}")
-        panes[m.group(0)] = {"owner": surface, "workspace": own, "command": name, "label": label}
+        panes[m.group(0)] = {"owner": surface, "workspace": own, "command": name, "label": label,
+                             "splits": splits}
         save_panes(panes)
     if label:
         try:
@@ -583,7 +590,7 @@ def tool_pane_list(cfg, args):
             save_panes(panes)
     mine = [{"pane": ref, "command": rec.get("command"), "label": rec.get("label")}
             for ref, rec in sorted(panes.items()) if rec.get("owner") == surface]
-    return {"panes": mine, "open": len(panes), "max_panes": cfg["max_panes"]}
+    return {"panes": mine, "commands": sorted(cfg["commands"]), "open": len(panes), "max_panes": cfg["max_panes"]}
 
 
 def tool_pane_send(cfg, args):
@@ -663,13 +670,12 @@ TOOLS = [
     ("cmux_progress", tool_progress, "Shows a progress bar in this session's sidebar entry, or clears it with "
      "value null.", {"value": {"type": ["number", "null"], "description": "0 to 1"}, "label": {"type": "string"}}, []),
     ("cmux_close", tool_close, "Closes a workspace and ends whatever runs in it. Ask the user first.", WS, ["workspace"]),
-    ("cmux_pane_open", tool_pane_open, "Opens a pane next to this session's that runs one of the user's named "
-     "commands (e.g. another agent). The pane closes when the command ends.", {
+    ("cmux_pane_open", tool_pane_open, "Opens a pane right of this session's that runs one of the user's named "
+     "commands (e.g. another agent); more panes stack in that column. The pane closes when the command ends.", {
          "command": {"type": "string", "description": "a name from the user's [commands], see cmux_pane_list"},
-         "direction": {"type": "string", "enum": ["right", "down"], "description": "default: right"},
          "label": {"type": "string", "description": "a tab title, e.g. the task"}}, ["command"]),
-    ("cmux_pane_list", tool_pane_list, "The panes this session opened that still exist, how many are open on "
-     "this Mac, and the most the user allows.", {}, []),
+    ("cmux_pane_list", tool_pane_list, "The panes this session opened that still exist, the command names "
+     "cmux_pane_open takes, how many panes are open on this Mac, and the most the user allows.", {}, []),
     ("cmux_pane_send", tool_pane_send, "Types one line into a pane this session opened, then Enter (unless "
      "enter is false). No \\n, \\r or \\t in the text.", dict(PANE, text={"type": "string"}, enter={"type": "boolean"}), ["pane", "text"]),
     ("cmux_pane_key", tool_pane_key, "Presses a key in a pane this session opened, e.g. ctrl-c or escape.",
