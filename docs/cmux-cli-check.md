@@ -12,8 +12,8 @@ below. The tests pin them with a fake cmux (`PaneTests` in
 | Tool | cmux call |
 |------|-----------|
 | `cmux_pane_open` (first pane) | `new-split right --workspace <ws> --surface <own> --command "exec <command> \|\| exit"` |
-| `cmux_pane_open` (more panes) | `new-split down --workspace <ws> --surface <tallest own pane> --command ...`: they stack right of the session's pane |
-| `cmux_pane_open` (then) | `list-panes --workspace <ws> --json`; if the session's pane is narrower than `lead_width` % of `container_frame.width`: `resize-pane --workspace <ws> --pane <its pane> -R --amount <points short>` |
+| `cmux_pane_open` (more panes) | `new-split down --workspace <ws> --surface <tallest pane of the column> --command ...`: up to 4 per column; the fifth pane starts a second column with `new-split right` from the session's pane |
+| `cmux_pane_open` (then) | `list-panes --workspace <ws> --json`; one column: if the session's pane is narrower than `lead_width` % of `container_frame.width`, `resize-pane --workspace <ws> --pane <its pane> -R --amount <points short>`; two columns: the session's pane and then the column next to it to a third each, `-R` to grow, `-L` to shrink |
 | `cmux_pane_open` (with `label`) | then `rename-tab --workspace <ws> --surface <p> <label>` |
 | `cmux_pane_send` | `send --workspace <ws> --surface <p> <text>`, then `send-key ... enter` (unless `enter` is false) |
 | `cmux_pane_key` | `send-key --workspace <ws> --surface <p> enter\|escape\|tab\|up\|down\|ctrl-c` |
@@ -56,6 +56,7 @@ cmux new-split right --workspace "$WS" --surface "$CMUX_SURFACE_ID" --command "e
 P=surface:7
 cmux --json list-panes --workspace "$WS"                                       # container_frame.width and each pane's pixel_frame.width, in points
 cmux resize-pane --workspace "$WS" --pane pane:1 -R --amount 100              # use your pane's ref from above: its right edge moves about 100 points
+cmux resize-pane --workspace "$WS" --pane pane:1 -L --amount 100              # and back: -L moves the right edge left
 cmux new-split down --workspace "$WS" --surface "$P" --command "exec zsh || exit"         # a second pane opens below it; yours keeps its full height
 cmux close-surface --workspace "$WS" --surface surface:8 --force               # use the ref it printed; the first pane is full height again
 cmux rename-tab --workspace "$WS" --surface "$P" cli-check                      # the new pane's tab reads cli-check

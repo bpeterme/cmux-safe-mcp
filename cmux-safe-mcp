@@ -41,6 +41,7 @@ COMMAND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 EXTRAS = {"close", "panes"}  # actions that stay off unless listed in allow =
 SETTINGS_KEYS = {"folder", "allow", "cmux", "command", "max_panes", "lead_width"}
 DEFAULT_MAX_PANES = 4
+COLUMN_PANES = 4  # panes per column right of the session's own; two columns, so 8 panes at most
 DEFAULT_LEAD_WIDTH = 60  # percent of the window the session's own pane keeps when it opens panes
 # Keys a pane may get, by the name the agent uses: cmux send-key's names.
 KEYS = {"enter": "enter", "escape": "escape", "tab": "tab", "up": "up", "down": "down",
@@ -99,8 +100,8 @@ def load_config(path=None):
         max_panes = int(s.get("max_panes", DEFAULT_MAX_PANES))
     except ValueError:
         max_panes = -1
-    if not 1 <= max_panes <= 32:
-        raise Refused("[settings] max_panes must be a number from 1 to 32")
+    if not 1 <= max_panes <= 2 * COLUMN_PANES:
+        raise Refused(f"[settings] max_panes must be a number from 1 to {2 * COLUMN_PANES}")
     try:
         lead_width = int(s.get("lead_width", DEFAULT_LEAD_WIDTH))
     except ValueError:
@@ -564,12 +565,16 @@ def tool_pane_open(cfg, args):
         if len(panes) >= cfg["max_panes"]:
             raise Refused(f"{len(panes)} panes are open, the most the user allows (max_panes = {cfg['max_panes']}) "
                           "— close one first (cmux_pane_close)")
-        # The lead keeps its full height and at least half the width: the first pane
-        # opens right of it, later ones stack in that column, each splitting the
-        # tallest pane there (the oldest on a tie).
-        mine = [(ref, rec) for ref, rec in panes.items() if rec.get("owner") == surface]
-        if mine:
-            ref, base = min(mine, key=lambda p: p[1].get("splits", 0))
+        # The lead keeps its full height. Its panes fill a column right of it, up to
+        # COLUMN_PANES, then a second one; each new pane splits the tallest pane of
+        # its column (the oldest on a tie). An empty column opens right of the lead.
+        cols = {1: [], 2: []}
+        for ref, rec in panes.items():
+            if rec.get("owner") == surface:
+                cols[2 if rec.get("column") == 2 else 1].append((ref, rec))
+        column = 1 if len(cols[1]) < COLUMN_PANES else 2
+        if cols[column]:
+            ref, base = min(cols[column], key=lambda p: p[1].get("splits", 0))
             base["splits"] = base.get("splits", 0) + 1
             where, splits = ["down", "--workspace", own, "--surface", ref], base["splits"]
         else:
@@ -580,29 +585,48 @@ def tool_pane_open(cfg, args):
         if not m:
             raise Refused(f"cmux new-split gave no pane: {out[-300:] or 'no output'}")
         panes[m.group(0)] = {"owner": surface, "workspace": own, "command": name, "label": label,
-                             "splits": splits}
+                             "column": column, "splits": splits}
         save_panes(panes)
+        mine = {ref: rec.get("column", 1) for ref, rec in panes.items() if rec.get("owner") == surface}
     if label:
         try:
             cmux(cfg, ["rename-tab", "--workspace", own, "--surface", m.group(0), label])
         except Refused:
             pass  # the label is a nicety
-    widen_lead(cfg, own, surface)
+    fit_layout(cfg, own, surface, mine)
     return {"pane": m.group(0), "command": name, "label": label}
 
 
-def widen_lead(cfg, own, surface):
-    """Widens the session's own pane to lead_width percent of the window when it
-    is narrower. cmux reports widths and resizes in points. A nicety: any
-    problem leaves the layout as it is."""
-    try:
+def fit_layout(cfg, own, surface, mine):
+    """Sizes the columns: with one column of panes, the session's own pane gets at
+    least lead_width percent of the window; with two, it and the column next to it
+    get a third each. mine maps the session's panes to their column. cmux reports
+    widths and resizes in points. A nicety: any problem leaves the layout as it is."""
+    two = len(set(mine.values())) > 1
+
+    def layout():
         data = json.loads(cmux(cfg, ["list-panes", "--workspace", own, "--json"]))
-        total = float(data["container_frame"]["width"])
-        lead = next(p for p in data["panes"]
-                    if surface in (p.get("surface_refs") or []) + (p.get("surface_ids") or []))
-        short = int(total * cfg["lead_width"] / 100 - float(lead["pixel_frame"]["width"]))
-        if short >= float(lead.get("cell_width_points") or 8):  # at least one column
-            cmux(cfg, ["resize-pane", "--workspace", own, "--pane", lead["ref"], "-R", "--amount", str(short)])
+        return float(data["container_frame"]["width"]), data["panes"]
+
+    def surfaces(p):
+        return (p.get("surface_refs") or []) + (p.get("surface_ids") or [])
+
+    def fit(p, target, shrink):
+        delta = int(target - float(p["pixel_frame"]["width"]))
+        if abs(delta) < float(p.get("cell_width_points") or 8) or (delta < 0 and not shrink):
+            return  # within a column of the target, or wider than asked
+        cmux(cfg, ["resize-pane", "--workspace", own, "--pane", p["ref"], "-R" if delta > 0 else "-L",
+                   "--amount", str(abs(delta))])
+
+    try:
+        total, items = layout()
+        lead = next(p for p in items if surface in surfaces(p))
+        fit(lead, total / 3 if two else total * cfg["lead_width"] / 100, shrink=two)
+        if two:  # the column right next to the lead
+            total, items = layout()
+            near = min((p for p in items if set(surfaces(p)) & set(mine)),
+                       key=lambda p: float(p["pixel_frame"]["x"]))
+            fit(near, total / 3, shrink=True)
     except (Refused, ValueError, KeyError, TypeError, StopIteration):
         pass
 

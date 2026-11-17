@@ -421,6 +421,35 @@ class PaneTests(Base):
                 m.load_config()
             self.assertIn("lead_width must be a number from 50 to 90", str(cm.exception))
 
+    def test_two_columns_of_four_at_most(self):
+        self.write_config(settings=PANES.replace("max_panes = 2", "max_panes = 8"))
+        p = [self.call("cmux_pane_open", {"command": "worker"})["pane"] for _ in range(8)]
+        # Column 1 fills to four, then a second column opens right of the lead.
+        self.assertEqual([(x[1], x[5]) for x in self.argv("new-split")],
+                         [("right", LEAD), ("down", p[0]), ("down", p[0]), ("down", p[1]),
+                          ("right", LEAD), ("down", p[4]), ("down", p[4]), ("down", p[5])])
+        self.assertIn("max_panes = 8", self.refused("cmux_pane_open", {"command": "worker"}))
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(p[2] + "\n")  # a pane of column 1 ends: the next one goes there again
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("new-split")[-1][1:6:4], ["down", p[0]])
+
+    def test_two_columns_take_a_third_each(self):
+        self.write_config(settings=PANES.replace("max_panes = 2", "max_panes = 8"))
+        with open(os.path.join(self.t, "panes-layout.json"), "w") as f:
+            json.dump({"container_frame": {"width": 1353.55}, "panes": [
+                {"ref": "pane:1", "surface_refs": [LEAD], "pixel_frame": {"width": 812.1, "x": 0}},
+                {"ref": "pane:6", "surface_refs": ["surface:104"], "pixel_frame": {"width": 270, "x": 812.1}},
+                {"ref": "pane:2", "surface_refs": ["surface:100"], "pixel_frame": {"width": 271.4, "x": 1082.1}}]}, f)
+        for _ in range(4):
+            self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("resize-pane"), [])  # one column: the lead is wide enough
+        self.assertEqual(self.call("cmux_pane_open", {"command": "worker"})["pane"], "surface:104")
+        # A third of 1353.55 is 451.2: the lead gives 360 points, the column next to it gets 181.
+        self.assertEqual(self.argv("resize-pane"), [
+            ["resize-pane", "--workspace", "workspace:1", "--pane", "pane:1", "-L", "--amount", "360"],
+            ["resize-pane", "--workspace", "workspace:1", "--pane", "pane:6", "-R", "--amount", "181"]])
+
     def test_list_names_the_commands(self):
         self.assertEqual(self.call("cmux_pane_list")["commands"], ["shell", "worker"])
 
@@ -516,6 +545,7 @@ class PaneTests(Base):
 
     def test_settings_problems(self):
         for settings, want in [("allow = panes\nmax_panes = 0\n[commands]\nw = x", "max_panes must be"),
+                               ("allow = panes\nmax_panes = 9\n[commands]\nw = x", "from 1 to 8"),
                                ("allow = panes\n[commands]\nW! = x", "[commands] w!: a name"),
                                ("allow = panes\n[commands]\nw =", "[commands] w must be one command")]:
             self.write_config(settings=settings)
