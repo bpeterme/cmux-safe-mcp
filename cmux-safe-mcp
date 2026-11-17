@@ -4,9 +4,10 @@
 Lets an agent you don't want at your keyboard work with cmux: list workspaces,
 open a repo in a new workspace (cloned when missing), switch to, rename, color,
 describe, pin and (opt-in) close workspaces, and notify you or show status in
-its own sidebar entry. Never: typing into terminals, running commands, reading
-screens, the browser, or any other cmux command. The only command a new
-workspace starts is the one in your settings (command =), never the agent's.
+its own sidebar entry. Opt-in (allow = panes): open panes next to its own that
+run a command you named in the settings, and type into, read and close only
+those panes. Never: typing into or reading any other terminal, running a command
+of the agent's choice, the browser, or any other cmux command.
 
 Made for agents in containers (e.g. cbox, whose host MCP relay runs it on the
 Mac), and useful for any MCP client. Settings: ~/.config/cmux-safe-mcp/config.
@@ -34,8 +35,16 @@ SOURCE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 WORKSPACE_RE = re.compile(r"^(workspace:\d{1,20}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
                           r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$")
 STATUS_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
-EXTRAS = {"close"}  # actions that stay off unless listed in allow =
-SETTINGS_KEYS = {"folder", "allow", "cmux", "command"}
+SURFACE_RE = re.compile(r"^(surface:\d{1,20}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+                        r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$")
+COMMAND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+EXTRAS = {"close", "panes"}  # actions that stay off unless listed in allow =
+SETTINGS_KEYS = {"folder", "allow", "cmux", "command", "max_panes"}
+DEFAULT_MAX_PANES = 4
+# Keys a pane may get, by the name the agent uses: cmux send-key's names.
+KEYS = {"enter": "enter", "escape": "escape", "tab": "tab", "up": "up", "down": "down",
+        "ctrl-c": "ctrl-c"}
+READ_LINES_MAX = 200
 SOURCE_KEYS = {"repos", "clone"}
 # Fields of cmux's workspace list passed on. Not the others: cmux also reports
 # the latest messages of agents running in each workspace.
@@ -79,9 +88,23 @@ def load_config(path=None):
     folder = os.path.expanduser(s.get("folder", DEFAULT_FOLDER))
     if not os.path.isabs(folder):
         raise Refused("[settings] folder must be an absolute path, e.g. folder = ~/Workspace")
+    commands = dict(cp["commands"]) if cp.has_section("commands") else {}
+    for name, line in commands.items():
+        if not COMMAND_NAME_RE.match(name):
+            raise Refused(f"[commands] {name}: a name may only contain a-z, 0-9, '_' and '-'")
+        if not line.strip() or any(ord(c) < 32 or ord(c) == 127 for c in line):
+            raise Refused(f"[commands] {name} must be one command on one line, e.g. {name} = cbox")
+    try:
+        max_panes = int(s.get("max_panes", DEFAULT_MAX_PANES))
+    except ValueError:
+        max_panes = -1
+    if not 1 <= max_panes <= 32:
+        raise Refused("[settings] max_panes must be a number from 1 to 32")
+    if "panes" in allow and not commands:
+        raise Refused("allow = panes needs a [commands] section: the commands a pane may run, e.g. worker = cbox")
     sources = []
     for name in cp.sections():
-        if name == "settings":
+        if name in ("settings", "commands"):
             continue
         src = dict(cp[name])
         if not SOURCE_RE.match(name):
@@ -101,7 +124,8 @@ def load_config(path=None):
     if any(ord(c) < 32 or ord(c) == 127 for c in command):
         raise Refused("[settings] command must be one line")
     return {"folder": os.path.realpath(folder), "allow": allow, "cmux": s.get("cmux", ""),
-            "command": command, "sources": sources}
+            "command": command, "sources": sources,
+            "commands": {n: c.strip() for n, c in commands.items()}, "max_panes": max_panes}
 
 
 def tilde(path):
@@ -454,7 +478,160 @@ def tool_close(cfg, args):
     return {"closed": w}
 
 
+# --- panes (opt-in: allow = panes) ----------------------------------------------
+#
+# A pane belongs to the session that opened it (cmux's CMUX_SURFACE_ID of that
+# session, which cbox's relay passes per session). Only its owner may type into,
+# read or close it; the record lives in a state file, so a restarted session in
+# the same terminal finds its panes again. Limits count panes that still exist.
+
+def state_path():
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(base, "cmux-safe-mcp", "panes.json")
+
+
+def load_panes():
+    try:
+        with open(state_path()) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
+
+
+def save_panes(panes):
+    path = state_path()
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(panes, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def own_surface():
+    """The calling session's own pane (cmux sets CMUX_SURFACE_ID), or Refused."""
+    surface = os.environ.get("CMUX_SURFACE_ID", "")
+    if not SURFACE_RE.match(surface):
+        raise Refused("this session's pane is unknown: start the agent (or cbox) from a cmux terminal")
+    return surface
+
+
+def alive(cfg, ref, rec):
+    try:
+        cmux(cfg, ["read-screen", "--workspace", rec["workspace"], "--surface", ref, "--lines", "1"])
+        return True
+    except Refused:
+        return False
+
+
+def prune(cfg, panes):
+    """Drops records of panes that are gone (their command ended or someone closed them)."""
+    gone = [ref for ref, rec in panes.items() if not alive(cfg, ref, rec)]
+    for ref in gone:
+        del panes[ref]
+    return bool(gone)
+
+
+def owned_pane(cfg, args):
+    ref = args.get("pane")
+    if not isinstance(ref, str) or not SURFACE_RE.match(ref):
+        raise Refused("pane must be a ref like surface:12, from cmux_pane_open or cmux_pane_list")
+    surface = own_surface()
+    rec = load_panes().get(ref)
+    if not rec or rec.get("owner") != surface:
+        raise Refused(f"{ref} is not a pane this session opened (see cmux_pane_list)")
+    return ref, rec
+
+
+def tool_pane_open(cfg, args):
+    name = args.get("command")
+    if not isinstance(name, str) or name not in cfg["commands"]:
+        raise Refused(f"command must be one of: {', '.join(sorted(cfg['commands']))} (the user's [commands])")
+    direction = args.get("direction") or "right"
+    if direction not in ("right", "down"):
+        raise Refused("direction must be right or down")
+    label = text_arg(args, "label", 60, required=False)
+    surface, own = own_surface(), own_or_refuse(cfg)
+    with Lock():
+        panes = load_panes()
+        if prune(cfg, panes):
+            save_panes(panes)
+        if len(panes) >= cfg["max_panes"]:
+            raise Refused(f"{len(panes)} panes are open, the most the user allows (max_panes = {cfg['max_panes']}) "
+                          "— close one first (cmux_pane_close)")
+        # The command comes from the user's settings only. exec: the pane closes when it ends.
+        out = cmux(cfg, ["new-split", direction, "--workspace", own, "--surface", surface,
+                         "--command", f"exec {cfg['commands'][name]} || exit"])
+        m = re.search(r"\bsurface:\d+\b", out)
+        if not m:
+            raise Refused(f"cmux new-split gave no pane: {out[-300:] or 'no output'}")
+        panes[m.group(0)] = {"owner": surface, "workspace": own, "command": name, "label": label}
+        save_panes(panes)
+    if label:
+        try:
+            cmux(cfg, ["rename-tab", "--workspace", own, "--surface", m.group(0), label])
+        except Refused:
+            pass  # the label is a nicety
+    return {"pane": m.group(0), "command": name, "label": label}
+
+
+def tool_pane_list(cfg, args):
+    surface = own_surface()
+    with Lock():
+        panes = load_panes()
+        if prune(cfg, panes):
+            save_panes(panes)
+    mine = [{"pane": ref, "command": rec.get("command"), "label": rec.get("label")}
+            for ref, rec in sorted(panes.items()) if rec.get("owner") == surface]
+    return {"panes": mine, "open": len(panes), "max_panes": cfg["max_panes"]}
+
+
+def tool_pane_send(cfg, args):
+    ref, rec = owned_pane(cfg, args)
+    text = text_arg(args, "text", 4000)
+    enter = args.get("enter", True)
+    if not isinstance(enter, bool):
+        raise Refused("enter must be true or false")
+    cmux(cfg, ["send", "--workspace", rec["workspace"], "--surface", ref, text])
+    if enter:
+        cmux(cfg, ["send-key", "--workspace", rec["workspace"], "--surface", ref, "enter"])
+    return {"pane": ref, "sent": True, "enter": enter}
+
+
+def tool_pane_key(cfg, args):
+    ref, rec = owned_pane(cfg, args)
+    key = args.get("key")
+    if key not in KEYS:
+        raise Refused(f"key must be one of: {', '.join(KEYS)}")
+    cmux(cfg, ["send-key", "--workspace", rec["workspace"], "--surface", ref, KEYS[key]])
+    return {"pane": ref, "key": key}
+
+
+def tool_pane_read(cfg, args):
+    ref, rec = owned_pane(cfg, args)
+    lines = args.get("lines", 50)
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= READ_LINES_MAX:
+        raise Refused(f"lines must be a number from 1 to {READ_LINES_MAX}")
+    return {"pane": ref, "screen": cmux(cfg, ["read-screen", "--workspace", rec["workspace"], "--surface", ref,
+                                              "--lines", str(lines)])}
+
+
+def tool_pane_close(cfg, args):
+    ref, rec = owned_pane(cfg, args)
+    with Lock():
+        try:
+            cmux(cfg, ["close-surface", "--workspace", rec["workspace"], "--surface", ref, "--force"])
+        except Refused:
+            if alive(cfg, ref, rec):
+                raise
+        panes = load_panes()
+        panes.pop(ref, None)
+        save_panes(panes)
+    return {"closed": ref}
+
+
 WS = {"workspace": {"type": "string", "description": "A ref like workspace:12, from cmux_list"}}
+PANE = {"pane": {"type": "string", "description": "A ref like surface:12, from cmux_pane_open"}}
 TOOLS = [
     ("cmux_list", tool_list, "All cmux workspaces: ref, title, color, description, folder, pinned, selected. "
      "this_session marks the workspace this session runs in.", {}, []),
@@ -481,10 +658,27 @@ TOOLS = [
     ("cmux_progress", tool_progress, "Shows a progress bar in this session's sidebar entry, or clears it with "
      "value null.", {"value": {"type": ["number", "null"], "description": "0 to 1"}, "label": {"type": "string"}}, []),
     ("cmux_close", tool_close, "Closes a workspace and ends whatever runs in it. Ask the user first.", WS, ["workspace"]),
+    ("cmux_pane_open", tool_pane_open, "Opens a pane next to this session's that runs one of the user's named "
+     "commands (e.g. another agent). The pane closes when the command ends.", {
+         "command": {"type": "string", "description": "a name from the user's [commands], see cmux_pane_list"},
+         "direction": {"type": "string", "enum": ["right", "down"], "description": "default: right"},
+         "label": {"type": "string", "description": "a tab title, e.g. the task"}}, ["command"]),
+    ("cmux_pane_list", tool_pane_list, "The panes this session opened that still exist, how many are open on "
+     "this Mac, and the most the user allows.", {}, []),
+    ("cmux_pane_send", tool_pane_send, "Types one line into a pane this session opened, then Enter (unless "
+     "enter is false).", dict(PANE, text={"type": "string"}, enter={"type": "boolean"}), ["pane", "text"]),
+    ("cmux_pane_key", tool_pane_key, "Presses a key in a pane this session opened, e.g. ctrl-c or escape.",
+     dict(PANE, key={"type": "string", "enum": list(KEYS)}), ["pane", "key"]),
+    ("cmux_pane_read", tool_pane_read, "The last lines on the screen of a pane this session opened.",
+     dict(PANE, lines={"type": "integer", "description": f"1 to {READ_LINES_MAX}, default 50"}), ["pane"]),
+    ("cmux_pane_close", tool_pane_close, "Closes a pane this session opened and ends what runs in it.", PANE, ["pane"]),
 ]
-EXTRA_TOOLS = {"cmux_close": "close"}
+EXTRA_TOOLS = {"cmux_close": "close", "cmux_pane_open": "panes", "cmux_pane_list": "panes",
+               "cmux_pane_send": "panes", "cmux_pane_key": "panes", "cmux_pane_read": "panes",
+               "cmux_pane_close": "panes"}
 NOTE = ("cmux tools: the user's terminal app on their Mac. Workspaces are tabs in its sidebar. These tools "
-        "cannot type into terminals or read them.")
+        "cannot type into terminals or read them, except panes this session opened with cmux_pane_open "
+        "(when the user allows it).")
 
 
 def tools_for(cfg):
@@ -565,6 +759,9 @@ def check():
         return 1
     print(f"✔ cmux answers: {len(items)} workspaces")
     print(f"  tools: {', '.join(t[0] for t in tools_for(cfg))}")
+    if "panes" in cfg["allow"]:
+        print(f"  panes: up to {cfg['max_panes']}, commands: "
+              + ", ".join(f"{n} = {c}" for n, c in sorted(cfg["commands"].items())))
     if os.environ.get("CMUX_WORKSPACE_ID"):
         print("ℹ  This terminal is inside cmux, which cmux lets in anyway. A background process (like\n"
               "   cbox's relay) may not be: check from another terminal app too.")
@@ -578,8 +775,12 @@ Settings: {path}
   [settings]
   folder  = ~/Workspace           # where repos go (optional)
   command = cbox                  # optional: run in each opened workspace (e.g. cbox, claude)
-  allow   = close                 # optional: also let the agent close workspaces
+  allow   = close panes           # optional: also close workspaces / open and drive its own panes
+  max_panes = 4                   # optional: panes open at once on this Mac (allow = panes)
   cmux    = /path/to/cmux         # optional: when cmux is not on the PATH
+
+  [commands]                      # allow = panes: what a pane may run, by name
+  worker  = cbox
 
   [github]                        # a git host; any name, the first one is tried first
   repos   = my-user/*, my-org/app # owner/name patterns the agent may open

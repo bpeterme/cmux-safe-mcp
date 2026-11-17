@@ -4,10 +4,16 @@
 [settings]
 folder  = ~/Workspace            # where repos go (default: ~/Workspace)
 # command = cbox                 # run in each workspace cmux_open opens (e.g. cbox, claude)
-# allow   = close                # also offer cmux_close (never the agent's own workspace)
+# allow   = close panes          # close: offer cmux_close (never the agent's own workspace)
+#                                # panes: open panes running a [commands] entry, drive only those
+# max_panes = 4                  # panes open at once on this Mac (allow = panes)
 # cmux    = /path/to/cmux        # when cmux is not on the PATH
 
-# One section per git host; any name. For a bare repo name, the first host
+# allow = panes: what a pane may run, by name. The agent picks a name, never a command.
+# [commands]
+# worker = cbox
+
+# One section per git host; any name ("settings" and "commands" are taken). For a bare repo name, the first host
 # that has the repo wins.
 [github]
 repos   = my-user/*, my-org/app  # owner/name patterns the agent may open
