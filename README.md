@@ -105,7 +105,8 @@ worker    = cbox
 
 A pane runs its command with `exec`: it closes when the command ends. Only the
 session that opened a pane can type into it, read it or close it; a session
-restarted in the same terminal gets its panes back.
+restarted in the same terminal gets its panes back. The cmux calls behind the
+pane tools, and a checklist to try them on your Mac: `docs/cmux-cli-check.md`.
 
 **Choose the commands with care:** the agent types into these panes. A command
 like `cbox` gives it another agent in a container. A shell (`zsh`) or a host
