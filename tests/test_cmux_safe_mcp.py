@@ -30,8 +30,23 @@ FAKE_CMUX = textwrap.dedent("""\
     if os.path.exists(os.path.join(here, "cmux.fail")):
         sys.stderr.write("Error: ERROR: Access denied - only processes started inside cmux can connect\\n")
         sys.exit(1)
+    def surface():
+        return sys.argv[sys.argv.index("--surface") + 1]
+    closed = os.path.join(here, "closed")
+    gone = open(closed).read().split() if os.path.exists(closed) else []
     if sys.argv[1] == "new-workspace":
         print("OK workspace:42")
+    elif sys.argv[1] == "new-split":
+        n = len([l for l in open(os.path.join(here, "cmux.log")) if '"new-split"' in l])
+        print(f"OK surface:{99 + n} workspace:1")
+    elif sys.argv[1] in ("read-screen", "send", "send-key", "close-surface") and surface() in gone:
+        sys.stderr.write("Error: not_found: surface not found\\n")
+        sys.exit(1)
+    elif sys.argv[1] == "read-screen":
+        print(f"screen of {surface()}")
+    elif sys.argv[1] == "close-surface":
+        open(closed, "a").write(surface() + "\\n")
+        print("OK")
     elif sys.argv[1] == "list-workspaces":
         print(open(os.path.join(here, "list.json")).read())
     else:
@@ -67,6 +82,8 @@ class Base(unittest.TestCase):
         self.addCleanup(self.restore_env)
         os.environ.pop("CMUX_WORKSPACE_ID", None)
         os.environ["PWD"] = "/nowhere"
+        os.environ.pop("CMUX_SURFACE_ID", None)
+        os.environ["XDG_STATE_HOME"] = os.path.join(self.t, "state")
         os.environ["CMUX_SAFE_MCP_CONFIG"] = os.path.join(self.t, "config")
         self.write_config()
 
@@ -301,6 +318,105 @@ class OwnWorkspaceTests(Base):
         self.assertIn("own workspace", self.refused("cmux_close", {"workspace": OWN_ID}))
         self.assertEqual(self.call("cmux_close", {"workspace": "workspace:2"}), {"closed": "workspace:2"})
         self.assertEqual(self.calls()[-1]["argv"], ["close-workspace", "--workspace", "workspace:2"])
+
+
+LEAD = "surface:7"
+PANES = """allow = panes
+            max_panes = 2
+            [commands]
+            worker = cbox --worker
+            shell = zsh"""
+
+
+class PaneTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_config(settings=PANES)
+        os.environ["CMUX_WORKSPACE_ID"] = OWN_ID
+        os.environ["CMUX_SURFACE_ID"] = LEAD
+
+    def argv(self, cmd):
+        return [c["argv"] for c in self.calls() if c["argv"][0] == cmd]
+
+    def test_off_unless_allowed_and_needs_commands(self):
+        self.write_config()
+        names = {t["name"] for t in m.tool_specs(m.load_config())}
+        self.assertFalse({n for n in names if n.startswith("cmux_pane")})
+        self.assertIn("unknown tool", self.refused("cmux_pane_open", {"command": "worker"}))
+        self.write_config(settings="allow = panes")
+        with self.assertRaises(m.Refused) as cm:
+            m.load_config()
+        self.assertIn("needs a [commands] section", str(cm.exception))
+
+    def test_open_runs_only_a_named_command_next_to_the_own_pane(self):
+        out = self.call("cmux_pane_open", {"command": "worker", "direction": "down", "label": "fix-12"})
+        self.assertEqual(out, {"pane": "surface:100", "command": "worker", "label": "fix-12"})
+        self.assertEqual(self.argv("new-split"), [["new-split", "down", "--workspace", "workspace:1", "--surface",
+                                                   LEAD, "--command", "exec cbox --worker || exit"]])
+        self.assertEqual(self.argv("rename-tab"), [["rename-tab", "--workspace", "workspace:1", "--surface",
+                                                    "surface:100", "fix-12"]])
+        self.assertIn("command must be one of: shell, worker", self.refused("cmux_pane_open", {"command": "rm -rf ~"}))
+        self.assertIn("does not take", self.refused("cmux_pane_open", {"command": "worker", "cwd": "/"}))
+        self.refused("cmux_pane_open", {"command": "worker", "direction": "left"})
+
+    def test_send_key_read_close_act_on_own_panes(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        self.call("cmux_pane_send", {"pane": p, "text": "run the tests"})
+        self.call("cmux_pane_send", {"pane": p, "text": "no enter", "enter": False})
+        self.call("cmux_pane_key", {"pane": p, "key": "ctrl-c"})
+        self.assertEqual(self.call("cmux_pane_read", {"pane": p, "lines": 20})["screen"], f"screen of {p}")
+        target = ["--workspace", "workspace:1", "--surface", p]
+        self.assertEqual(self.argv("send"), [["send"] + target + ["run the tests"], ["send"] + target + ["no enter"]])
+        self.assertEqual(self.argv("send-key"), [["send-key"] + target + ["enter"], ["send-key"] + target + ["ctrl-c"]])
+        self.assertIn(["read-screen"] + target + ["--lines", "20"], self.argv("read-screen"))
+        self.assertEqual(self.call("cmux_pane_close", {"pane": p}), {"closed": p})
+        self.assertEqual(self.argv("close-surface"), [["close-surface"] + target + ["--force"]])
+        self.assertEqual(self.call("cmux_pane_list")["panes"], [])
+
+    def test_arguments_are_checked(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        n = len(self.calls())
+        for tool, args in [("cmux_pane_send", {"pane": p, "text": "a\nb"}),
+                           ("cmux_pane_send", {"pane": p, "text": "\x1b[A"}),
+                           ("cmux_pane_send", {"pane": p, "text": "x" * 4001}),
+                           ("cmux_pane_send", {"pane": p, "text": "x", "enter": "yes"}),
+                           ("cmux_pane_key", {"pane": p, "key": "ctrl-d"}),
+                           ("cmux_pane_read", {"pane": p, "lines": 201}),
+                           ("cmux_pane_read", {"pane": "surface:1; ls"})]:
+            self.refused(tool, args)
+        self.assertEqual(len(self.calls()), n)
+
+    def test_other_panes_are_out_of_reach(self):
+        p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        os.environ["CMUX_SURFACE_ID"] = "surface:8"  # another session, same workspace
+        for tool, args in [("cmux_pane_send", {"pane": p, "text": "x"}), ("cmux_pane_read", {"pane": p}),
+                           ("cmux_pane_key", {"pane": p, "key": "enter"}), ("cmux_pane_close", {"pane": p})]:
+            self.assertIn("not a pane this session opened", self.refused(tool, args))
+        self.assertIn("not a pane this session opened", self.refused("cmux_pane_read", {"pane": LEAD}))
+        self.assertEqual(self.call("cmux_pane_list")["panes"], [])
+        del os.environ["CMUX_SURFACE_ID"]
+        self.assertIn("pane is unknown", self.refused("cmux_pane_read", {"pane": p}))
+        self.assertIn("pane is unknown", self.refused("cmux_pane_open", {"command": "worker"}))
+        os.environ["CMUX_SURFACE_ID"] = LEAD  # the same terminal again, e.g. a restarted lead
+        self.assertEqual([x["pane"] for x in self.call("cmux_pane_list")["panes"]], [p])
+
+    def test_limit_counts_panes_that_still_exist(self):
+        a = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+        self.call("cmux_pane_open", {"command": "shell"})
+        self.assertIn("max_panes = 2", self.refused("cmux_pane_open", {"command": "worker"}))
+        with open(os.path.join(self.t, "closed"), "a") as f:
+            f.write(a + "\n")  # its command ended: cmux closed it
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.call("cmux_pane_list")["open"], 2)
+
+    def test_settings_problems(self):
+        for settings, want in [("allow = panes\nmax_panes = 0\n[commands]\nw = x", "max_panes must be"),
+                               ("allow = panes\n[commands]\nW! = x", "[commands] w!: a name"),
+                               ("allow = panes\n[commands]\nw =", "[commands] w must be one command")]:
+            self.write_config(settings=settings)
+            with self.assertRaises(m.Refused) as cm:
+                m.load_config()
+            self.assertIn(want, str(cm.exception), settings)
 
 
 class ConfigTests(Base):

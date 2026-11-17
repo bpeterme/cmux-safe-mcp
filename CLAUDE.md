@@ -11,11 +11,15 @@ without cbox, and nothing in it may depend on cbox.
 
 ## Safety rules — never weaken without the user's explicit OK
 
-1. **No tool that controls or reads terminals.** Never offer typing, pasting, keys,
-   running commands, reading screens or selections, screenshots, recordings, the
-   browser, ssh, hooks, raw socket calls (`rpc`), sudo or settings.
-2. **The start command comes only from the settings** (`[settings] command =`),
-   never from a tool argument.
+1. **No tool that controls or reads terminals**, with one exception: the opt-in
+   pane tools (`allow = panes`, OK'd by the user 2026-11-17). They act only on
+   panes this server opened for the calling session (owner = its
+   `CMUX_SURFACE_ID`, recorded in the state file), never on the session's own
+   pane or anyone else's. Keys are a fixed list. Never offer pasting, reading
+   selections, screenshots, recordings, the browser, ssh, hooks, raw socket
+   calls (`rpc`), sudo or settings.
+2. **Start commands come only from the settings** (`[settings] command =` for
+   workspaces, a name from `[commands]` for panes), never from a tool argument.
 3. **Every tool maps to fixed cmux argv lists**: no shell. Values from the agent
    are checked before use: workspace refs by regex, text without control
    characters, never starting with `-`, length limits.
@@ -24,7 +28,8 @@ without cbox, and nothing in it may depend on cbox.
 5. **No default targets:** drop `CMUX_WORKSPACE_ID`/`CMUX_SURFACE_ID` when calling
    cmux, and pass `--workspace` explicitly.
 6. **Riskier actions are opt-in** (`allow =`, see `EXTRAS`), off by default. Close
-   never closes the agent's own workspace.
+   never closes the agent's own workspace. Open panes are capped (`max_panes`),
+   counting only panes that still exist.
 
 ## Working mode
 
