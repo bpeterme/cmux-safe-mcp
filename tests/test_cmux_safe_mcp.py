@@ -50,6 +50,9 @@ FAKE_CMUX = textwrap.dedent("""\
         print("OK")
     elif sys.argv[1] == "list-workspaces":
         print(open(os.path.join(here, "list.json")).read())
+    elif sys.argv[1] == "list-panes":
+        layout = os.path.join(here, "panes-layout.json")
+        print(open(layout).read() if os.path.exists(layout) else "Error: no layout")
     else:
         print("OK")
     """)
@@ -372,6 +375,51 @@ class PaneTests(Base):
             f.write(f"{a}\n{b}\n{c}\n{d}\n")
         self.call("cmux_pane_open", {"command": "worker"})  # all gone: right of the lead again
         self.assertEqual(self.argv("new-split")[-1][1:6:4], ["right", LEAD])
+
+    def layout(self, lead_width, lead="surface:7"):
+        with open(os.path.join(self.t, "panes-layout.json"), "w") as f:
+            json.dump({"container_frame": {"width": 1353.55, "height": 1052}, "panes": [
+                {"ref": "pane:1", "surface_refs": [lead], "cell_width_points": 8,
+                 "pixel_frame": {"width": lead_width, "x": 0}},
+                {"ref": "pane:2", "surface_refs": ["surface:100"], "cell_width_points": 8,
+                 "pixel_frame": {"width": 1353.55 - lead_width, "x": lead_width}},
+                {"ref": "pane:3", "dock_scope": "global", "surface_refs": []}]}, f)
+
+    def test_lead_is_widened_to_lead_width(self):
+        self.layout(676.3)
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("list-panes"), [["list-panes", "--workspace", "workspace:1", "--json"]])
+        # 60% of 1353.55 is 812.1: 135 points short.
+        self.assertEqual(self.argv("resize-pane"), [["resize-pane", "--workspace", "workspace:1", "--pane", "pane:1",
+                                                     "-R", "--amount", "135"]])
+
+    def test_lead_is_left_alone_when_wide_enough_or_unknown(self):
+        for case in ("wide", "less than a column", "not found", "no layout", "bad json"):
+            if case == "wide":
+                self.layout(900)
+            elif case == "less than a column":
+                self.layout(806)
+            elif case == "not found":
+                self.layout(676.3, lead="surface:55")
+            elif case == "no layout":
+                os.remove(os.path.join(self.t, "panes-layout.json"))
+            else:
+                with open(os.path.join(self.t, "panes-layout.json"), "w") as f:
+                    f.write('{"panes": 3}')
+            p = self.call("cmux_pane_open", {"command": "worker"})["pane"]
+            self.assertEqual(self.argv("resize-pane"), [], case)
+            self.call("cmux_pane_close", {"pane": p})
+
+    def test_lead_width_setting(self):
+        self.write_config(settings=PANES.replace("[commands]", "lead_width = 75\n            [commands]"))
+        self.layout(676.3)
+        self.call("cmux_pane_open", {"command": "worker"})
+        self.assertEqual(self.argv("resize-pane")[0][-1], "338")  # 75% of 1353.55 = 1015.2
+        for bad in ("49", "91", "wide"):
+            self.write_config(settings=PANES.replace("[commands]", f"lead_width = {bad}\n            [commands]"))
+            with self.assertRaises(m.Refused) as cm:
+                m.load_config()
+            self.assertIn("lead_width must be a number from 50 to 90", str(cm.exception))
 
     def test_list_names_the_commands(self):
         self.assertEqual(self.call("cmux_pane_list")["commands"], ["shell", "worker"])

@@ -32,7 +32,7 @@ workspace ref, a title, a color.
 | `cmux_notify` | Shows you a notification ("tests pass", "needs your input") |
 | `cmux_status`, `cmux_progress` | A short status or a progress bar in the agent's own sidebar entry |
 | `cmux_close` | Closes a workspace. **Off** unless your settings say `allow = close`; never the agent's own |
-| `cmux_pane_open`, `cmux_pane_list` | Opens a pane that runs a command you named in `[commands]`: the first right of the agent's own, more stacked in that column, so the agent's pane keeps its full height and at least half the width; lists the panes it opened and the command names. **Off** unless `allow = panes` |
+| `cmux_pane_open`, `cmux_pane_list` | Opens a pane that runs a command you named in `[commands]`: the first right of the agent's own, more stacked in that column, so the agent's pane keeps its full height and `lead_width` percent of the width; lists the panes it opened and the command names. **Off** unless `allow = panes` |
 | `cmux_pane_send`, `cmux_pane_key`, `cmux_pane_read`, `cmux_pane_close` | Types a line, presses a key (Enter, Escape, Tab, Up, Down, Ctrl-C), reads the screen, closes — only in panes this session opened |
 
 **Never offered:** typing, keys or reading in any terminal the agent did not
@@ -98,6 +98,7 @@ example one worker agent per task.
 [settings]
 allow     = panes
 max_panes = 4                  # panes open at once on this Mac (default 4)
+lead_width = 60                # the agent's pane keeps this % of the window width (50-90, default 60)
 
 [commands]                     # what a pane may run; the agent picks a name
 worker    = cbox

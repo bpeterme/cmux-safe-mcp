@@ -39,8 +39,9 @@ SURFACE_RE = re.compile(r"^(surface:\d{1,20}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A
                         r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$")
 COMMAND_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 EXTRAS = {"close", "panes"}  # actions that stay off unless listed in allow =
-SETTINGS_KEYS = {"folder", "allow", "cmux", "command", "max_panes"}
+SETTINGS_KEYS = {"folder", "allow", "cmux", "command", "max_panes", "lead_width"}
 DEFAULT_MAX_PANES = 4
+DEFAULT_LEAD_WIDTH = 60  # percent of the window the session's own pane keeps when it opens panes
 # Keys a pane may get, by the name the agent uses: cmux send-key's names.
 KEYS = {"enter": "enter", "escape": "escape", "tab": "tab", "up": "up", "down": "down",
         "ctrl-c": "ctrl-c"}
@@ -100,6 +101,12 @@ def load_config(path=None):
         max_panes = -1
     if not 1 <= max_panes <= 32:
         raise Refused("[settings] max_panes must be a number from 1 to 32")
+    try:
+        lead_width = int(s.get("lead_width", DEFAULT_LEAD_WIDTH))
+    except ValueError:
+        lead_width = -1
+    if not 50 <= lead_width <= 90:
+        raise Refused("[settings] lead_width must be a number from 50 to 90 (percent of the window)")
     if "panes" in allow and not commands:
         raise Refused("allow = panes needs a [commands] section: the commands a pane may run, e.g. worker = cbox")
     sources = []
@@ -125,7 +132,8 @@ def load_config(path=None):
         raise Refused("[settings] command must be one line")
     return {"folder": os.path.realpath(folder), "allow": allow, "cmux": s.get("cmux", ""),
             "command": command, "sources": sources,
-            "commands": {n: c.strip() for n, c in commands.items()}, "max_panes": max_panes}
+            "commands": {n: c.strip() for n, c in commands.items()}, "max_panes": max_panes,
+            "lead_width": lead_width}
 
 
 def tilde(path):
@@ -579,7 +587,24 @@ def tool_pane_open(cfg, args):
             cmux(cfg, ["rename-tab", "--workspace", own, "--surface", m.group(0), label])
         except Refused:
             pass  # the label is a nicety
+    widen_lead(cfg, own, surface)
     return {"pane": m.group(0), "command": name, "label": label}
+
+
+def widen_lead(cfg, own, surface):
+    """Widens the session's own pane to lead_width percent of the window when it
+    is narrower. cmux reports widths and resizes in points. A nicety: any
+    problem leaves the layout as it is."""
+    try:
+        data = json.loads(cmux(cfg, ["list-panes", "--workspace", own, "--json"]))
+        total = float(data["container_frame"]["width"])
+        lead = next(p for p in data["panes"]
+                    if surface in (p.get("surface_refs") or []) + (p.get("surface_ids") or []))
+        short = int(total * cfg["lead_width"] / 100 - float(lead["pixel_frame"]["width"]))
+        if short >= float(lead.get("cell_width_points") or 8):  # at least one column
+            cmux(cfg, ["resize-pane", "--workspace", own, "--pane", lead["ref"], "-R", "--amount", str(short)])
+    except (Refused, ValueError, KeyError, TypeError, StopIteration):
+        pass
 
 
 def tool_pane_list(cfg, args):
@@ -771,7 +796,7 @@ def check():
     print(f"✔ cmux answers: {len(items)} workspaces")
     print(f"  tools: {', '.join(t[0] for t in tools_for(cfg))}")
     if "panes" in cfg["allow"]:
-        print(f"  panes: up to {cfg['max_panes']}, commands: "
+        print(f"  panes: up to {cfg['max_panes']}, this pane keeps {cfg['lead_width']}% of the width, commands: "
               + ", ".join(f"{n} = {c}" for n, c in sorted(cfg["commands"].items())))
     if os.environ.get("CMUX_WORKSPACE_ID"):
         print("ℹ  This terminal is inside cmux, which cmux lets in anyway. A background process (like\n"

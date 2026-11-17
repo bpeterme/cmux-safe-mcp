@@ -15,7 +15,9 @@ without cbox, and nothing in it may depend on cbox.
    pane tools (`allow = panes`, OK'd by the user 2026-11-17). They act only on
    panes this server opened for the calling session (owner = its
    `CMUX_SURFACE_ID`, recorded in the state file), never on the session's own
-   pane or anyone else's. Keys are a fixed list. Never offer pasting, reading
+   pane or anyone else's. The one exception is layout: after opening a pane, the
+   server may widen the session's own pane to `lead_width` (`resize-pane`, OK'd
+   by the user 2026-11-17). Keys are a fixed list. Never offer pasting, reading
    selections, screenshots, recordings, the browser, ssh, hooks, raw socket
    calls (`rpc`), sudo or settings.
 2. **Start commands come only from the settings** (`[settings] command =` for

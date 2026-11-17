@@ -13,6 +13,7 @@ below. The tests pin them with a fake cmux (`PaneTests` in
 |------|-----------|
 | `cmux_pane_open` (first pane) | `new-split right --workspace <ws> --surface <own> --command "exec <command> \|\| exit"` |
 | `cmux_pane_open` (more panes) | `new-split down --workspace <ws> --surface <tallest own pane> --command ...`: they stack right of the session's pane |
+| `cmux_pane_open` (then) | `list-panes --workspace <ws> --json`; if the session's pane is narrower than `lead_width` % of `container_frame.width`: `resize-pane --workspace <ws> --pane <its pane> -R --amount <points short>` |
 | `cmux_pane_open` (with `label`) | then `rename-tab --workspace <ws> --surface <p> <label>` |
 | `cmux_pane_send` | `send --workspace <ws> --surface <p> <text>`, then `send-key ... enter` (unless `enter` is false) |
 | `cmux_pane_key` | `send-key --workspace <ws> --surface <p> enter\|escape\|tab\|up\|down\|ctrl-c` |
@@ -53,6 +54,8 @@ cmux list-workspaces                                                            
 WS=workspace:3
 cmux new-split right --workspace "$WS" --surface "$CMUX_SURFACE_ID" --command "exec zsh || exit"   # a pane opens; prints OK surface:N workspace:N
 P=surface:7
+cmux --json list-panes --workspace "$WS"                                       # container_frame.width and each pane's pixel_frame.width, in points
+cmux resize-pane --workspace "$WS" --pane pane:1 -R --amount 100              # use your pane's ref from above: its right edge moves about 100 points
 cmux new-split down --workspace "$WS" --surface "$P" --command "exec zsh || exit"         # a second pane opens below it; yours keeps its full height
 cmux close-surface --workspace "$WS" --surface surface:8 --force               # use the ref it printed; the first pane is full height again
 cmux rename-tab --workspace "$WS" --surface "$P" cli-check                      # the new pane's tab reads cli-check
